@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { test } from "node:test";
-import { extractPlanJson, normalizePlan } from "../src/planner.ts";
+import type { ChildProcess } from "node:child_process";
+import {
+	BLIND_PLANNER_SYSTEM_PROMPT,
+	buildPlannerArgs,
+	extractPlanJson,
+	normalizePlan,
+	plannerExplores,
+	plan,
+	PLANNER_SYSTEM_PROMPT,
+} from "../src/planner.ts";
 
 test("extractPlanJson parses raw JSON", () => {
 	const raw = JSON.stringify({
@@ -82,4 +92,194 @@ test("normalizePlan rejects non-plan shapes", () => {
 test("extractPlanJson throws a diagnostic for garbage output", () => {
 	assert.throws(() => extractPlanJson("I cannot produce JSON right now."), /not a valid plan/);
 	assert.throws(() => extractPlanJson('{"unrelated": true}'), /not a valid plan/);
+});
+
+// ---------------------------------------------------------------------------
+// Exploring planner (read-only pi subprocess) vs. blind single completion
+// ---------------------------------------------------------------------------
+
+const validPlanJson = JSON.stringify({
+	goal: "Add tests for the parser",
+	steps: [
+		{ id: "s1", title: "Survey", prompt: "Survey the repo.", dependsOn: [] },
+		{ id: "s2", title: "Verify", prompt: "Run the test suite.", dependsOn: ["s1"] },
+	],
+});
+
+/** Minimal ExtensionCommandContext for plan() (model + cwd + thinking). */
+function fakeCtx(): any {
+	return { model: { provider: "test", id: "model" }, cwd: "/tmp/repo", thinkingLevel: undefined };
+}
+
+/**
+ * Fake pi subprocess: emits the given JSONL events on stdout (plus optional
+ * stderr), then closes with `exitCode`. Always closes so aborts can't hang.
+ */
+function fakeProc(events: unknown[], exitCode = 0, stderr = ""): ChildProcess {
+	const proc = new EventEmitter() as any;
+	const out = new EventEmitter();
+	const err = new EventEmitter();
+	proc.stdout = out;
+	proc.stderr = err;
+	proc.killed = false;
+	proc.kill = () => {
+		proc.killed = true;
+		return true;
+	};
+	setImmediate(() => {
+		if (stderr) err.emit("data", Buffer.from(stderr + "\n"));
+		if (events.length > 0) out.emit("data", Buffer.from(events.map((e) => JSON.stringify(e)).join("\n") + "\n"));
+		proc.emit("close", exitCode);
+	});
+	return proc as unknown as ChildProcess;
+}
+
+function assistantMessage(text: string, extra: Record<string, unknown> = {}) {
+	return {
+		role: "assistant",
+		stopReason: "stop",
+		model: "test/model",
+		content: [{ type: "text", text }],
+		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 } },
+		...extra,
+	};
+}
+
+test("buildPlannerArgs pins a read-only, extension-free planner subagent", () => {
+	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium"), [
+		"--mode", "json", "-p", "--no-session",
+		"--model", "anthropic/claude-x",
+		"--thinking", "medium",
+		"--no-extensions", "--no-skills", "--no-context-files",
+		"--tools", "read,grep,find,ls",
+		"--system-prompt", PLANNER_SYSTEM_PROMPT,
+	]);
+});
+
+test("buildPlannerArgs omits --thinking when undefined", () => {
+	assert.ok(!buildPlannerArgs("p/m").includes("--thinking"));
+});
+
+test("agentic prompt requires exploration + verification; blind prompt stays JSON-only", () => {
+	assert.match(PLANNER_SYSTEM_PROMPT, /explore the repository/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /read-only/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /verification is required/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
+	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
+});
+
+test("plannerExplores env parsing (on by default)", () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		assert.equal(plannerExplores(), true);
+		process.env.DAG_PLAN_PLANNER_EXPLORE = "1";
+		assert.equal(plannerExplores(), true);
+		for (const off of ["0", "false", "off", " OFF "]) {
+			process.env.DAG_PLAN_PLANNER_EXPLORE = off;
+			assert.equal(plannerExplores(), false);
+		}
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() explores via subprocess and extracts the plan", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		const snippets: string[] = [];
+		const result = await plan(fakeCtx(), "Add tests", {
+			onExplore: (s) => snippets.push(s),
+			spawnImpl: (_command, args, cwd) => {
+				assert.equal(cwd, "/tmp/repo");
+				assert.equal(args[args.indexOf("--system-prompt") + 1], PLANNER_SYSTEM_PROMPT);
+				assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+				return fakeProc([
+					{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
+					{ type: "message_end", message: assistantMessage(`Plan:\n\n\u0060\u0060\u0060json\n${validPlanJson}\n\u0060\u0060\u0060`) },
+				]);
+			},
+		});
+		assert.ok(result);
+		assert.equal(result!.plan.steps.length, 2);
+		assert.equal(result!.usage.input, 10);
+		assert.equal(result!.usage.turns, 1);
+		assert.deepEqual(snippets, ["read package.json"]);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() returns null when aborted", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		const ctrl = new AbortController();
+		ctrl.abort();
+		const result = await plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 130) }, ctrl.signal);
+		assert.equal(result, null);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() throws a diagnostic when the planner subagent fails", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		await assert.rejects(
+			plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 1, "npm: command not found") }),
+			/command not found/,
+		);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() throws when the planner output is not a valid plan", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		await assert.rejects(
+			plan(fakeCtx(), "x", {
+				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage("I cannot do that.") }]),
+			}),
+			/not a valid plan/,
+		);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() uses the blind single completion when exploration is disabled", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	process.env.DAG_PLAN_PLANNER_EXPLORE = "0";
+	try {
+		let capturedSystemPrompt: string | undefined;
+		const ctx: any = {
+			...fakeCtx(),
+			modelRegistry: {
+				complete: async (_model: unknown, req: { systemPrompt: string }) => {
+					capturedSystemPrompt = req.systemPrompt;
+					return {
+						stopReason: "stop",
+						content: [{ type: "text", text: validPlanJson }],
+						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+					};
+				},
+			},
+		};
+		const result = await plan(ctx, "x");
+		assert.ok(result);
+		assert.equal(capturedSystemPrompt, BLIND_PLANNER_SYSTEM_PROMPT);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
 });

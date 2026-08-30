@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
-import { buildTaskPrompt, getMaxParallel, runPlan } from "../src/executor.ts";
+import { buildTaskPrompt, getMaxParallel, runPiSubagent, runPlan } from "../src/executor.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -366,4 +366,67 @@ test("buildTaskPrompt omits missing dep outputs", () => {
 	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2", ["s1"])] };
 	const prompt = buildTaskPrompt(plan, plan.steps[1]!, new Map());
 	assert.ok(!prompt.includes("Outputs from prerequisite steps"));
+});
+
+// ---------------------------------------------------------------------------
+// runPiSubagent (shared runner: executor nodes + exploring planner)
+// ---------------------------------------------------------------------------
+
+test("runPiSubagent collects output, usage, and live tool calls", async () => {
+	const h = makeHarness({
+		program: (record) => {
+			record.proc.emitSuccess("final report", "read", { file_path: "package.json" });
+		},
+	});
+	const calls: Array<[string, Record<string, unknown>]> = [];
+	const run = await runPiSubagent({
+		cwd: "/tmp/x",
+		signal: new AbortController().signal,
+		args: ["--mode", "json", "-p", "--no-session", "--model", "test/model"],
+		prompt: "PLAN THIS",
+		spawnImpl: h.spawnImpl,
+		onToolCall: (toolName, args) => calls.push([toolName, args]),
+	});
+	assert.equal(run.exitCode, 0);
+	assert.equal(run.output, "final report");
+	assert.equal(run.usage.turns, 1);
+	assert.equal(run.usage.input, 100);
+	assert.equal(run.model, "test/model");
+	assert.equal(run.wasAborted, false);
+	assert.deepEqual(calls, [["read", { file_path: "package.json" }]]);
+	// Prompt is the trailing positional arg; cwd is passed through.
+	const [rec] = h.spawns;
+	assert.equal(rec.args[rec.args.length - 1], "PLAN THIS");
+	assert.equal(rec.cwd, "/tmp/x");
+});
+
+test("runPiSubagent captures stderr for failure diagnostics", async () => {
+	const h = makeHarness({
+		program: (record) => record.proc.emitFailure(2, "line one\nline two"),
+	});
+	const run = await runPiSubagent({
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		args: [],
+		prompt: "x",
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(run.exitCode, 2);
+	assert.match(run.stderr, /line two/);
+});
+
+test("runPiSubagent with a pre-aborted signal kills the child", async () => {
+	const controller = new AbortController();
+	controller.abort();
+	const h = makeHarness({ program: () => {} });
+	const run = await runPiSubagent({
+		cwd: process.cwd(),
+		signal: controller.signal,
+		args: [],
+		prompt: "x",
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(run.wasAborted, true);
+	assert.ok(h.spawns[0]!.proc.killed);
+	assert.ok(h.spawns[0]!.proc.signals.includes("SIGTERM"));
 });

@@ -16,7 +16,7 @@ import {
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 import { runPlan } from "./executor.ts";
-import { plan, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
+import { plan, plannerExplores, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
 import * as plans from "./plans.ts";
 import type { DagEvent, NodeResult, PlannerResult } from "./types.ts";
 import { addUsage } from "./types.ts";
@@ -34,6 +34,7 @@ const PLAN_MESSAGE_TYPE = "dag-plan";
 const NODE_ENTRY_TYPE = "dag-node";
 const MAX_REFINE_ATTEMPTS = 3;
 const STATUS_KEY = "dag-runner";
+const PLANNER_STATUS_KEY = "dag-planner";
 
 type PlanPhaseOutcome = { ok: true; result: PlannerResult } | { ok: false; error: string };
 
@@ -258,11 +259,32 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		priorJson: string | undefined,
 	): Promise<PlanPhaseOutcome | null> {
 		return ctx.ui.custom<PlanPhaseOutcome | null>((tui, theme, _kb, done) => {
-			const loader = new BorderedLoader(tui, theme, `Planning with ${modelLabel}…`, { cancellable: true });
-			loader.onAbort = () => done(null);
-			plan(ctx, prompt, { feedback, priorPlanJson: priorJson }, loader.signal)
-				.then((r) => done(r ? { ok: true, result: r } : null))
-				.catch((e) => done({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+			const label = plannerExplores()
+				? `Planning with ${modelLabel} (exploring repo)…`
+				: `Planning with ${modelLabel}…`;
+			const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
+			// Guard: Esc calls done(null) while the (killed) planner subagent may
+			// still settle the promise afterwards — done() must run exactly once.
+			let settled = false;
+			const finish = (outcome: PlanPhaseOutcome | null) => {
+				if (settled) return;
+				settled = true;
+				ctx.ui.setStatus(PLANNER_STATUS_KEY, undefined);
+				done(outcome);
+			};
+			loader.onAbort = () => finish(null);
+			plan(
+				ctx,
+				prompt,
+				{
+					feedback,
+					priorPlanJson: priorJson,
+					onExplore: (snippet) => ctx.ui.setStatus(PLANNER_STATUS_KEY, `planning: ${snippet}`),
+				},
+				loader.signal,
+			)
+				.then((r) => finish(r ? { ok: true, result: r } : null))
+				.catch((e) => finish({ ok: false, error: e instanceof Error ? e.message : String(e) }));
 			return loader;
 		});
 	}

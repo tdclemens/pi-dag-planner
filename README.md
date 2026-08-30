@@ -26,7 +26,7 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[] }] }`. Each step prompt is self-contained because subagents have no shared context.
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[] }] }`. Each step prompt is self-contained because subagents have no shared context.
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
@@ -130,6 +130,7 @@ Totals: 4/4 succeeded · $0.0712 · 2m03s
 | Setting | Mechanism | Default |
 |---------|-----------|---------|
 | Max parallel nodes | env `DAG_PLAN_MAX_PARALLEL` | `4` |
+| Planner repo exploration (read-only subagent) | env `DAG_PLAN_PLANNER_EXPLORE` | on (`0`/`false`/`off` = single blind call) |
 | Planning retries on invalid JSON | — | 1 retry |
 | Refine attempts | — | 3 |
 | Plan directory | — | `~/.agents/plans/` (fixed) |

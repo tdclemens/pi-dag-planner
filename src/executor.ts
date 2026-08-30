@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { dependentsIndex } from "./dag.ts";
-import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, ToolSnippet } from "./types.ts";
+import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, UsageStats } from "./types.ts";
 import { addUsage, emptyUsage } from "./types.ts";
 
 export const DEFAULT_MAX_PARALLEL = 4;
@@ -209,54 +209,90 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 	return steps.map((s) => results.get(s.id)!);
 }
 
-/** Run one node as a pi subprocess; parses the JSONL event stream. */
-async function runNodeSubagent(
-	plan: DagPlan,
-	node: DagNode,
-	opts: RunPlanOptions,
-	results: Map<string, NodeResult>,
-): Promise<NodeResult> {
-	const startedAt = Date.now();
-	const depOutputs = new Map<string, string>();
-	for (const d of node.dependsOn) {
-		const r = results.get(d);
-		if (r && r.status === "done") depOutputs.set(d, r.output);
-	}
-	const task = buildTaskPrompt(plan, node, depOutputs);
+/** Collected outcome of one ephemeral pi subprocess. */
+export interface PiSubagentResult {
+	exitCode: number;
+	/** Final assistant text; "" when no text message was received. */
+	output: string;
+	usage: UsageStats;
+	model?: string;
+	stopReason?: string;
+	/** Model-level error (from the assistant message), if any. */
+	modelError?: string;
+	/** Captured stderr (tail, capped). */
+	stderr: string;
+	wasAborted: boolean;
+}
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (opts.model) args.push("--model", opts.model);
-	if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
-	if (node.tools && node.tools.length > 0) args.push("--tools", node.tools.join(","));
-	args.push(task);
+export interface PiSubagentOptions {
+	cwd: string;
+	signal: AbortSignal;
+	/** pi CLI flags, everything before the trailing positional prompt. */
+	args: string[];
+	/** The task prompt; appended as the last positional argument. */
+	prompt: string;
+	/** Live tool-call observation (UI snippets / status line). */
+	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
+	/** Test seam: replace the subprocess spawn. */
+	spawnImpl?: (command: string, args: string[], cwd: string) => ChildProcess;
+}
 
-	const result: NodeResult = {
-		id: node.id,
-		title: node.title,
-		status: "running",
-		startedAt,
-		snippets: [],
+/**
+ * Run one ephemeral pi subagent (`--mode json -p --no-session` + `args` +
+ * `prompt`) and collect its final assistant output, usage, and live tool
+ * calls. Shared by the DAG executor (one subagent per node) and the
+ * exploring planner. SIGTERM→SIGKILL on abort, same as node runs.
+ */
+export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagentResult> {
+	const result: PiSubagentResult = {
+		exitCode: 0,
 		output: "",
 		usage: emptyUsage(),
+		stderr: "",
+		wasAborted: false,
 	};
 
 	let stderr = "";
-	let wasAborted = false;
+	let buffer = "";
+
+	const processLine = (line: string) => {
+		if (!line.trim()) return;
+		let event: any;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			return;
+		}
+		if (event.type === "tool_execution_start" && event.toolName) {
+			opts.onToolCall?.(String(event.toolName), event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {});
+		} else if (event.type === "message_end" && event.message && event.message.role === "assistant") {
+			const msg = event.message as AssistantMessage;
+			result.usage = addUsage(result.usage, usageFromMessage(msg));
+			result.usage.turns += 1;
+			if (msg.model) result.model = msg.model;
+			if (msg.stopReason) result.stopReason = msg.stopReason;
+			if (msg.errorMessage) result.modelError = msg.errorMessage;
+			const text = msg.content
+				.filter((c): c is { type: "text"; text: string } => c.type === "text")
+				.map((c) => c.text)
+				.join("\n");
+			if (text) result.output = text;
+		}
+	};
 
 	const exitCode = await new Promise<number>((resolve) => {
 		let settled = false;
-		let buffer = "";
 
 		let proc: ChildProcess;
 		try {
-			const invocation = getPiInvocation(args);
+			const invocation = getPiInvocation([...opts.args, opts.prompt]);
 			const spawnImpl =
 				opts.spawnImpl ??
 				((command: string, a: string[], cwd: string) =>
 					spawn(command, a, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }));
 			proc = spawnImpl(invocation.command, invocation.args, opts.cwd);
 		} catch (e) {
-			result.error = `failed to spawn subagent: ${e instanceof Error ? e.message : String(e)}`;
+			result.stderr = `failed to spawn subagent: ${e instanceof Error ? e.message : String(e)}`;
 			resolve(1);
 			return;
 		}
@@ -266,39 +302,6 @@ async function runNodeSubagent(
 			settled = true;
 			if (abortListener) opts.signal.removeEventListener("abort", abortListener);
 			resolve(code);
-		};
-
-		const processLine = (line: string) => {
-			if (!line.trim()) return;
-			let event: any;
-			try {
-				event = JSON.parse(line);
-			} catch {
-				return;
-			}
-			if (event.type === "tool_execution_start" && event.toolName) {
-				if (result.snippets.length < MAX_SNIPPETS) {
-					const snippet: ToolSnippet = {
-						toolName: String(event.toolName),
-						args:
-							event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {},
-					};
-					result.snippets.push(snippet);
-					opts.onEvent?.({ type: "snippet", nodeId: node.id, snippet });
-				}
-			} else if (event.type === "message_end" && event.message && event.message.role === "assistant") {
-				const msg = event.message as AssistantMessage;
-				result.usage = addUsage(result.usage, usageFromMessage(msg));
-				result.usage.turns += 1;
-				if (msg.model) result.model = msg.model;
-				if (msg.stopReason) result.stopReason = msg.stopReason;
-				if (msg.errorMessage) result.error = msg.errorMessage;
-				const text = msg.content
-					.filter((c): c is { type: "text"; text: string } => c.type === "text")
-					.map((c) => c.text)
-					.join("\n");
-				if (text) result.output = text;
-			}
 		};
 
 		proc.stdout?.on("data", (data: Buffer) => {
@@ -315,12 +318,12 @@ async function runNodeSubagent(
 			finish(code ?? 0);
 		});
 		proc.on("error", (e) => {
-			result.error = result.error ?? (e as Error).message;
+			result.stderr = result.stderr || (e as Error).message;
 			finish(1);
 		});
 
 		const abortListener = () => {
-			wasAborted = true;
+			result.wasAborted = true;
 			try {
 				proc.kill("SIGTERM");
 			} catch {
@@ -340,21 +343,77 @@ async function runNodeSubagent(
 	});
 
 	result.exitCode = exitCode;
-	result.finishedAt = Date.now();
+	// A spawn-level error (e.g. ENOENT) is recorded on result.stderr directly;
+	// otherwise the captured stderr tail wins.
+	result.stderr = result.stderr || stderr;
+	return result;
+}
 
-	if (wasAborted) {
+/** Run one DAG node as a pi subprocess (shared runner + node bookkeeping). */
+async function runNodeSubagent(
+	plan: DagPlan,
+	node: DagNode,
+	opts: RunPlanOptions,
+	results: Map<string, NodeResult>,
+): Promise<NodeResult> {
+	const startedAt = Date.now();
+	const depOutputs = new Map<string, string>();
+	for (const d of node.dependsOn) {
+		const r = results.get(d);
+		if (r && r.status === "done") depOutputs.set(d, r.output);
+	}
+	const task = buildTaskPrompt(plan, node, depOutputs);
+
+	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	if (opts.model) args.push("--model", opts.model);
+	if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
+	if (node.tools && node.tools.length > 0) args.push("--tools", node.tools.join(","));
+
+	const result: NodeResult = {
+		id: node.id,
+		title: node.title,
+		status: "running",
+		startedAt,
+		snippets: [],
+		output: "",
+		usage: emptyUsage(),
+	};
+
+	const run = await runPiSubagent({
+		cwd: opts.cwd,
+		signal: opts.signal,
+		args,
+		prompt: task,
+		spawnImpl: opts.spawnImpl,
+		onToolCall: (toolName, argsObj) => {
+			if (result.snippets.length < MAX_SNIPPETS) {
+				result.snippets.push({ toolName, args: argsObj });
+				opts.onEvent?.({ type: "snippet", nodeId: node.id, snippet: { toolName, args: argsObj } });
+			}
+		},
+	});
+
+	result.exitCode = run.exitCode;
+	result.finishedAt = Date.now();
+	result.output = run.output;
+	result.usage = run.usage;
+	result.model = run.model;
+	result.stopReason = run.stopReason;
+	result.error = run.modelError;
+
+	if (run.wasAborted) {
 		result.status = "aborted";
-	} else if (result.exitCode !== 0 || result.stopReason === "error") {
+	} else if (run.exitCode !== 0 || run.stopReason === "error") {
 		result.status = "failed";
 		if (!result.error) {
-			const tail = stderr.trim().split("\n").slice(-3).join(" ").slice(-500);
-			result.error = tail || `subagent exited with code ${result.exitCode}`;
+			const tail = run.stderr.trim().split("\n").slice(-3).join(" ").slice(-500);
+			result.error = tail || `subagent exited with code ${run.exitCode}`;
 		}
 	} else {
 		result.status = "done";
 	}
 	if (result.status === "failed" && !result.error) {
-		result.error = `subagent exited with code ${result.exitCode}`;
+		result.error = `subagent exited with code ${run.exitCode}`;
 	}
 	return result;
 }

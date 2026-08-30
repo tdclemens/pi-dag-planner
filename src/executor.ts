@@ -49,15 +49,21 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 }
 
 /** Build the self-contained task prompt for a node, injecting dep outputs. */
-export function buildTaskPrompt(plan: DagPlan, node: DagNode, depOutputs: Map<string, string>): string {
+export function buildTaskPrompt(
+	plan: DagPlan,
+	node: DagNode,
+	depOutputs: Map<string, string>,
+	originalPrompt?: string,
+): string {
 	const lines: string[] = [
 		"You are executing one node of a larger plan. Work autonomously and verify your own output.",
 		"",
 		`Overall goal: ${plan.goal}`,
-		`Your step: ${node.title}`,
-		"",
-		node.prompt,
 	];
+	if (originalPrompt && originalPrompt.trim()) {
+		lines.push(`Original request (verbatim, from the user): ${originalPrompt.trim()}`);
+	}
+	lines.push(`Your step: ${node.title}`, "", node.prompt);
 	const deps = node.dependsOn.filter((id) => depOutputs.has(id));
 	if (deps.length > 0) {
 		lines.push("", "Outputs from prerequisite steps (use them, don't redo their work):");
@@ -87,6 +93,11 @@ export interface RunPlanOptions {
 	model?: string;
 	thinkingLevel?: string;
 	maxParallel?: number;
+	/**
+	 * The user's original /dag-plan request, injected verbatim into every node
+	 * prompt so subagents see the full request, not just the one-line goal.
+	 */
+	originalPrompt?: string;
 	signal: AbortSignal;
 	onEvent?: (event: DagEvent) => void;
 	/** Test seam: replace the subprocess spawn. */
@@ -362,7 +373,7 @@ async function runNodeSubagent(
 		const r = results.get(d);
 		if (r && r.status === "done") depOutputs.set(d, r.output);
 	}
-	const task = buildTaskPrompt(plan, node, depOutputs);
+	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (opts.model) args.push("--model", opts.model);

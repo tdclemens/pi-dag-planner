@@ -368,6 +368,39 @@ test("buildTaskPrompt omits missing dep outputs", () => {
 	assert.ok(!prompt.includes("Outputs from prerequisite steps"));
 });
 
+test("buildTaskPrompt injects the original user request verbatim", () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2", ["s1"])] };
+	const original = "Migrate the project from CommonJS to ESM without breaking the test suite";
+	const prompt = buildTaskPrompt(plan, plan.steps[1]!, new Map([["s1", "artifacts"]]), original);
+	assert.ok(prompt.includes(`Original request (verbatim, from the user): ${original}`));
+	// Placed right after the goal, before the step prompt.
+	assert.ok(prompt.indexOf("Overall goal") < prompt.indexOf("Original request"));
+	assert.ok(prompt.indexOf("Original request") < prompt.indexOf("Your step"));
+});
+
+test("buildTaskPrompt omits the original request when not provided or blank", () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const p1 = buildTaskPrompt(plan, plan.steps[0]!, new Map());
+	const p2 = buildTaskPrompt(plan, plan.steps[0]!, new Map(), "   ");
+	assert.ok(!p1.includes("Original request"));
+	assert.ok(!p2.includes("Original request"));
+});
+
+test("runPlan passes the original request into every node prompt", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2", ["s1"])] };
+	const h = makeHarness();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		originalPrompt: "Do the thing, carefully",
+		spawnImpl: h.spawnImpl,
+	});
+	assert.ok(results.every((r) => r.status === "done"));
+	for (const rec of h.spawns) {
+		assert.match(rec.args[rec.args.length - 1]!, /Original request \(verbatim, from the user\): Do the thing, carefully/);
+	}
+});
+
 // ---------------------------------------------------------------------------
 // runPiSubagent (shared runner: executor nodes + exploring planner)
 // ---------------------------------------------------------------------------

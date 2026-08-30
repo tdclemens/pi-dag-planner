@@ -162,6 +162,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				cwd: ctx.cwd,
 				model: modelLabel,
 				thinkingLevel: ctx.thinkingLevel,
+				originalPrompt: prompt,
 				signal: controller.signal,
 				onEvent: (e: DagEvent) => {
 					if (e.type === "node-end") {

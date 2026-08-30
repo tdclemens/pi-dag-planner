@@ -1,0 +1,26 @@
+{
+	"name": "pi-dag-plan",
+	"version": "0.1.0",
+	"description": "pi extension: /dag-plan — plan a DAG of subagent steps and execute them in parallel with live progress",
+	"type": "module",
+	"keywords": [
+		"pi-package"
+	],
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"scripts": {
+		"test": "tsx --test test/*.test.ts",
+		"typecheck": "tsc --noEmit"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "0.84.4",
+		"@earendil-works/pi-coding-agent": "0.84.4",
+		"@earendil-works/pi-tui": "0.84.4",
+		"@types/node": "^22.0.0",
+		"tsx": "^4.0.0",
+		"typescript": "^5.0.0"
+	}
+}

@@ -153,7 +153,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		let finishedCount = 0;
 		let failedCount = 0;
 
-		ctx.ui.setStatus(STATUS_KEY, `🗺 0/${totalSteps} running…`);
+		ctx.ui.setStatus(STATUS_KEY, `0/${totalSteps} running…`);
 
 		const results: NodeResult[] | undefined = await ctx.ui.custom<NodeResult[] | undefined>((tui, theme, _kb, done) => {
 			const dashboard = new RunDashboard(dag, theme, () => controller.abort(), () => tui.requestRender());
@@ -170,7 +170,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 					dashboard.update(e);
 					if (e.type === "node-end") {
 						pi.appendEntry(NODE_ENTRY_TYPE, { ...e.result });
-						ctx.ui.setStatus(STATUS_KEY, `🗺 ${finishedCount}/${totalSteps}${failedCount > 0 ? " (failures)" : ""}`);
+						ctx.ui.setStatus(STATUS_KEY, `${finishedCount}/${totalSteps}${failedCount > 0 ? " (failures)" : ""}`);
 					}
 				},
 			});

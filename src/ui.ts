@@ -64,6 +64,11 @@ export function shortenHome(p: string): string {
 	return p;
 }
 
+/**
+ * Single-cell, non-emoji glyph per node status. All glyphs are 1 cell wide in
+ * every terminal (no RGI emoji / default-emoji-presentation codepoints), so
+ * the icon column stays aligned and width math in pi-tui matches reality.
+ */
 export function statusIcon(status: NodeStatus): string {
 	switch (status) {
 		case "done":
@@ -73,11 +78,26 @@ export function statusIcon(status: NodeStatus): string {
 		case "skipped":
 			return "⊘";
 		case "aborted":
-			return "⏹";
+			return "■";
 		case "running":
-			return "⏳";
-		default:
-			return "⏸";
+			return "▶";
+		default: // pending
+			return "○";
+	}
+}
+
+/** Theme color per node status — single source of truth for dashboard + cards. */
+export function statusColor(status: NodeStatus): ThemeColor {
+	switch (status) {
+		case "done":
+			return "success";
+		case "failed":
+			return "error";
+		case "running":
+		case "aborted":
+			return "warning";
+		default: // pending, skipped
+			return "dim";
 	}
 }
 
@@ -186,7 +206,7 @@ export function renderPlanMessage(
 
 	const { plan, planPath } = details;
 	const lines: string[] = [];
-	lines.push(theme.fg("accent", theme.bold(`🗺  DAG Plan — ${plan.steps.length} steps`)));
+	lines.push(theme.fg("accent", theme.bold(`DAG Plan — ${plan.steps.length} steps`)));
 	lines.push(theme.fg("dim", plan.goal));
 
 	let waves: DagNode[][];
@@ -197,14 +217,13 @@ export function renderPlanMessage(
 	}
 	lines.push(theme.fg("dim", `${waves.length} wave${waves.length > 1 ? "s" : ""}`));
 
+	const maxIdLen = Math.max(0, ...plan.steps.map((s) => s.id.length));
 	waves.forEach((wave, i) => {
 		const last = i === waves.length - 1;
 		lines.push(theme.fg("muted", `${last ? "└" : "├"}─ wave ${i + 1}${wave.length > 1 ? " (parallel)" : ""}`));
 		for (const node of wave) {
-			const hasDeps = node.dependsOn.length > 0;
-			const icon = theme.fg(hasDeps ? "accent" : "muted", hasDeps ? "◆" : "●");
-			const deps = hasDeps ? theme.fg("dim", `  (← ${node.dependsOn.join(", ")})`) : "";
-			lines.push(`  ${icon} ${theme.fg("toolTitle", node.id)}  ${node.title}${deps}`);
+			const deps = node.dependsOn.length > 0 ? theme.fg("dim", `  (← ${node.dependsOn.join(", ")})`) : "";
+			lines.push(`  ${theme.fg("muted", "●")} ${theme.fg("toolTitle", node.id.padEnd(maxIdLen))}  ${node.title}${deps}`);
 		}
 	});
 
@@ -240,9 +259,7 @@ export function renderNodeCard(
 	if (!data) return new Text(theme.fg("muted", "(no node data)"), 0, 0);
 
 	const container = new Container();
-	const iconColor =
-		data.status === "done" ? "success" : data.status === "failed" ? "error" : data.status === "aborted" ? "warning" : "dim";
-	const icon = theme.fg(iconColor, statusIcon(data.status));
+	const icon = theme.fg(statusColor(data.status), statusIcon(data.status));
 	const dur = data.startedAt !== undefined && data.finishedAt !== undefined ? formatDuration(data.finishedAt - data.startedAt) : "";
 	let head = `${icon} ${theme.fg("toolTitle", theme.bold(data.id))}  ${data.title}`;
 	if (dur) head += theme.fg("muted", `  ${dur}`);
@@ -371,32 +388,35 @@ export class RunDashboard implements Component {
 
 		const lines: string[] = [];
 		const header = this.finished
-			? t.fg("accent", t.bold("🗺  DAG runner — finished"))
-			: `${t.fg("accent", t.bold("🗺  DAG runner"))} ${t.fg("muted", `— ${done}/${total} done, ${running} running, ${pending} pending`)} ${t.fg("dim", "(esc: cancel)")}`;
+			? t.fg("accent", t.bold("DAG runner — finished"))
+			: `${t.fg("accent", t.bold("DAG runner"))} ${t.fg("muted", `— ${done}/${total} done, ${running} running, ${pending} pending`)} ${t.fg("dim", "(esc: cancel)")}`;
 		lines.push(truncateToWidth(header, width, ""));
 
+		const maxIdLen = Math.max(0, ...this.plan.steps.map((s) => s.id.length));
 		for (const node of this.plan.steps) {
 			const row = this.rows.get(node.id)!;
+			const glyph = t.fg(statusColor(row.status), statusIcon(row.status));
+			const id = t.fg("toolTitle", t.bold(node.id.padEnd(maxIdLen)));
 			let line: string;
 			switch (row.status) {
 				case "running": {
 					const snippet = row.snippet ? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t)) : t.fg("dim", "…");
-					line = `${t.fg("warning", "⏳")} ${t.fg("toolTitle", node.id)}  ${node.title}  ${snippet}`;
+					line = `${glyph} ${id}  ${node.title}  ${snippet}`;
 					break;
 				}
 				case "done": {
 					const dur = row.startedAt !== undefined && row.finishedAt !== undefined ? formatDuration(row.finishedAt - row.startedAt) : "";
-					line = `${t.fg("success", "✓")} ${t.fg("toolTitle", node.id)}  ${node.title}${dur ? t.fg("muted", `  ${dur}`) : ""}`;
+					line = `${glyph} ${id}  ${node.title}${dur ? t.fg("muted", `  ${dur}`) : ""}`;
 					break;
 				}
 				case "failed":
-					line = `${t.fg("error", "✗")} ${t.fg("toolTitle", node.id)}  ${node.title}`;
+					line = `${glyph} ${id}  ${node.title}`;
 					break;
 				case "skipped":
-					line = `${t.fg("dim", "⊘")} ${t.fg("dim", `${node.id}  ${node.title} (skipped)`)}`;
+					line = `${glyph} ${id}  ${t.fg("dim", `${node.title} (skipped)`)}`;
 					break;
 				case "aborted":
-					line = `${t.fg("warning", "⏹")} ${t.fg("dim", `${node.id}  ${node.title} (aborted)`)}`;
+					line = `${glyph} ${id}  ${t.fg("dim", `${node.title} (aborted)`)}`;
 					break;
 				default: {
 					const waiting = node.dependsOn.filter((d) => {
@@ -404,7 +424,7 @@ export class RunDashboard implements Component {
 						return dep && (dep.status === "pending" || dep.status === "running");
 					});
 					const wait = waiting.length > 0 ? t.fg("dim", `  (waiting: ${waiting.join(", ")})`) : "";
-					line = `${t.fg("dim", "⏸")} ${t.fg("dim", node.id)}  ${t.fg("dim", node.title)}${wait}`;
+					line = `${glyph} ${id}  ${t.fg("dim", node.title)}${wait}`;
 				}
 			}
 			lines.push(truncateToWidth(line, width, "…"));

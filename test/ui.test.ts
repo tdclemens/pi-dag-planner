@@ -94,7 +94,7 @@ test("render cache is invalidated by update() so repaints show fresh state", () 
 	emit({ type: "node-start", nodeId: "a" });
 	const after = dashboard.render(W);
 	assert.notStrictEqual(after, first, "event must bust the render cache");
-	assert.ok(after.some((l) => l.includes("⏳") && l.includes("Alpha")), after.join("\n"));
+	assert.ok(after.some((l) => l.includes("▶") && l.includes("Alpha")), after.join("\n"));
 });
 
 // ---------------------------------------------------------------------------
@@ -108,7 +108,7 @@ test("running row shows latest command snippet", () => {
 	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "read", args: { path: "src/foo.ts", offset: 10, limit: 30 } } });
 	const lines = dashboard.render(W);
 	const row = lines.find((l) => l.includes("Alpha"))!;
-	assert.ok(row.includes("⏳"), row);
+	assert.ok(row.includes("▶"), row);
 	assert.ok(row.includes("read") && row.includes("src/foo.ts"), row);
 	assert.ok(row.includes("src/foo.ts:10-39"), row);
 	assert.ok(!row.includes("ls src/"), "only the latest snippet should be shown");
@@ -152,7 +152,7 @@ test("failed, skipped and aborted rows render with their icons", () => {
 	h2.emit({ type: "node-end", nodeId: "a", result: result({ id: "a", status: "aborted" }) });
 	h2.emit({ type: "node-end", nodeId: "b", result: result({ id: "b", status: "aborted" }) });
 	const lines2 = h2.dashboard.render(W);
-	assert.ok(lines2.filter((l) => l.includes("⏹")).length === 2, lines2.join("\n"));
+	assert.ok(lines2.filter((l) => l.includes("■")).length === 2, lines2.join("\n"));
 });
 
 test("header switches to finished once every node is terminal", () => {

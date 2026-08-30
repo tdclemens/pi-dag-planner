@@ -9,13 +9,15 @@ A [pi.dev](https://pi.dev) TypeScript extension that adds a **`/dag-plan`** comm
 ```
 
 ```
-🗺  DAG Plan — 4 steps, 2 waves
-┌─ wave 1 (parallel) ──────────────────────────────
-│  ● s1  Survey repo structure
-│  ● s2  Read src/parser.ts and its usages
-└─ wave 2 ─────────────────────────────────────────
-   ◆ s3  Write tests for parser          (← s1, s2)
-   ◆ s4  Run tests and fix failures      (← s3)
+DAG Plan — 4 steps
+Add unit tests for src/parser.ts and run them
+2 waves
+├─ wave 1 (parallel)
+  ● s1  Survey repo structure
+  ● s2  Read src/parser.ts and its usages
+└─ wave 2
+  ● s3  Write tests for parser  (← s1, s2)
+  ● s4  Run tests and fix failures  (← s3)
 
 Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
@@ -34,14 +36,16 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
-   🗺 DAG runner — 2/4 done, 1 running, 1 pending   (esc: cancel)
-   ✓ s1  Survey repo structure                     14.2s
-   ✓ s2  Read src/parser.ts and its usages         18.9s
-   ⏳ s3  Write tests for parser        → $ ls src/
-   ⏸ s4  Run tests and fix failures      (waiting: s3)
+   DAG runner — 2/4 done, 1 running, 1 pending (esc: cancel)
+   ✓ s1  Survey repo structure              14.2s
+   ✓ s2  Read src/parser.ts and its usages  18.9s
+   ▶ s3  Write tests for parser   → $ ls src/
+   ○ s4  Run tests and fix failures (waiting: s3)
    ```
 
    When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. **Esc** cancels the run (children are terminated, state is finalized).
+
+   Node status icons (single-cell, non-emoji, so the column aligns in any terminal): `○` pending · `▶` running · `✓` done · `✗` failed · `⊘` skipped · `■` aborted. Usage lines show `↑` input tokens, `↓` output tokens, `R`/`W` cache read/write, then cost and model.
 
 ## Install
 
@@ -113,10 +117,10 @@ Examples:
 
 ## Results
 
-| node | status | duration | output excerpt |
-|------|--------|----------|----------------|
-| s1   | ✓      | 14.2s    | Found vitest config, src/parser.ts, 3 call sites… |
-| …    | …      | …        | … |
+| node | status   | duration | output excerpt |
+|------|----------|----------|----------------|
+| s1   | ✓ done   | 14.2s    | Found vitest config, src/parser.ts, 3 call sites… |
+| …    | …        | …        | … |
 
 Totals: 4/4 succeeded · $0.0712 · 2m03s
 ````

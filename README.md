@@ -150,8 +150,6 @@ src/
 └── types.ts     # shared types
 ```
 
-See [PLAN.md](./PLAN.md) for the full design document, API references, and milestones.
-
 ## Development
 
 ```bash

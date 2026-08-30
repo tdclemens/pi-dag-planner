@@ -9,7 +9,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { topologicalLevels } from "./dag.ts";
 import type { DagPlan, NodeResult } from "./types.ts";
-import { formatDuration, shortenHome, statusIcon, truncate } from "./ui.ts";
+import { formatDuration, reportExcerpt, shortenHome, statusIcon, truncate } from "./ui.ts";
 
 /** Fixed user-chosen location (not pi's config dir). */
 export const PLANS_DIR = path.join(os.homedir(), ".agents", "plans");
@@ -117,10 +117,8 @@ export async function appendResults(planPath: string, results: NodeResult[], tot
 		];
 		for (const r of results) {
 			const dur = r.startedAt !== undefined && r.finishedAt !== undefined ? formatDuration(r.finishedAt - r.startedAt) : "—";
-			const source = r.status === "failed" ? (r.error ?? r.output) : r.output;
-			const firstLine = (source ?? "").split("\n").find((l) => l.trim().length > 0) ?? "";
-			const excerpt = firstLine ? tableEscape(truncate(firstLine, 200)) : "—";
-			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status} | ${dur} | ${excerpt} |`);
+			const excerpt = reportExcerpt(r);
+			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status} | ${dur} | ${excerpt ? tableEscape(excerpt) : "—"} |`);
 		}
 		rows.push("");
 		rows.push(

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { RunDashboard } from "../src/ui.ts";
+import { reportExcerpt, renderPlanSummary, RunDashboard } from "../src/ui.ts";
 import type { DagEvent, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
 
@@ -13,6 +13,7 @@ import { emptyUsage } from "../src/types.ts";
 const theme = {
 	fg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
+	bg: (_name: string, text: string) => text,
 } as unknown as Theme;
 
 const plan: DagPlan = {
@@ -176,4 +177,98 @@ test("Escape triggers onAbort; other keys are ignored", () => {
 	assert.equal(h.aborts, 0);
 	h.dashboard.handleInput("\x1b");
 	assert.equal(h.aborts, 1);
+});
+
+// ---------------------------------------------------------------------------
+// reportExcerpt
+// ---------------------------------------------------------------------------
+
+test("reportExcerpt: first non-empty line of the node output", () => {
+	assert.equal(
+		reportExcerpt(result({ id: "a", status: "done", output: "\n\nDid the thing.\nMore detail." })),
+		"Did the thing.",
+	);
+});
+
+test("reportExcerpt: failed nodes prefer the error line; empty when nothing to show", () => {
+	assert.equal(
+		reportExcerpt(result({ id: "a", status: "failed", output: "partial", error: "boom: line1\nline2" })),
+		"boom: line1",
+	);
+	assert.equal(reportExcerpt(result({ id: "a", status: "failed", error: "boom" })), "boom");
+	assert.equal(reportExcerpt(result({ id: "a", status: "done" })), "");
+	assert.equal(reportExcerpt(result({ id: "a", status: "skipped", skipReason: "x" })), "");
+});
+
+test("reportExcerpt: truncated to maxChars with ellipsis", () => {
+	const out = reportExcerpt(result({ id: "a", status: "done", output: "x".repeat(300) }), 200);
+	assert.equal(out.length, 201);
+	assert.ok(out.endsWith("…"), out);
+});
+
+// ---------------------------------------------------------------------------
+// renderPlanSummary
+// ---------------------------------------------------------------------------
+
+/** Build a message in the shape index.ts sends (content + details). */
+function summaryMessage(results: NodeResult[], details?: unknown) {
+	const lines = ["DAG run completed — all steps succeeded."];
+	for (const r of results) {
+		lines.push(`${r.id} — ${r.title}`);
+		if (r.status === "skipped" && r.skipReason) lines.push(`    ${r.skipReason}`);
+		else {
+			const ex = reportExcerpt(r);
+			if (ex) lines.push(`    ${ex}`);
+		}
+	}
+	lines.push("", "Totals: 1.0s · plan: ~/.agents/plans/x.md");
+	return {
+		content: lines.join("\n"),
+		details: details ?? {
+			planPath: "/home/u/.agents/plans/x.md",
+			status: "completed",
+			succeeded: results.length,
+			failed: 0,
+			skipped: 0,
+			durationMs: 1000,
+			usage: emptyUsage(),
+			results: results.map((r) => ({ ...r, snippets: [] })),
+		},
+	};
+}
+
+test("renderPlanSummary collapsed: content as sent + Ctrl+O hint, no full reports", () => {
+	const msg = summaryMessage([
+		result({ id: "a", status: "done", output: "Did the thing.\nMore detail here" }),
+		result({ id: "b", status: "skipped", skipReason: "dependency a failed" }),
+	]);
+	const comp = renderPlanSummary(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(text.includes("DAG run completed"), text);
+	assert.ok(text.includes("Did the thing."), "excerpt line from content");
+	assert.ok(text.includes("(Ctrl+O: full reports)"), text);
+	assert.ok(!text.includes("More detail here"), "collapsed must not show full reports");
+});
+
+test("renderPlanSummary expanded: full reports, plan path, totals; no hint", () => {
+	const msg = summaryMessage([
+		result({ id: "a", status: "done", output: "Did the thing.\nMore detail here" }),
+		result({ id: "b", status: "skipped", skipReason: "dependency a failed" }),
+	]);
+	const comp = renderPlanSummary(msg as never, { expanded: true, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(text.includes("More detail here"), "expanded shows the full report");
+	assert.ok(text.includes("~/.agents/plans/x.md"), "plan path shortened to ~");
+	assert.ok(text.includes("dependency a failed"), text);
+	assert.ok(text.includes("Totals:"), text);
+	assert.ok(!text.includes("(Ctrl+O: full reports)"), text);
+});
+
+test("renderPlanSummary falls back to plain content without details", () => {
+	const comp = renderPlanSummary(
+		{ content: "DAG run completed — plain" } as never,
+		{ expanded: false, outputPad: 0 },
+		theme,
+	);
+	assert.ok(comp.render(W).join("\n").includes("DAG run completed — plain"));
 });

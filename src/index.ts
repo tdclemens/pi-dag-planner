@@ -25,12 +25,15 @@ import {
 	formatUsageStats,
 	renderNodeCard,
 	renderPlanMessage,
+	renderPlanSummary,
+	reportExcerpt,
 	RunDashboard,
 	shortenHome,
 	statusIcon,
 } from "./ui.ts";
 
 const PLAN_MESSAGE_TYPE = "dag-plan";
+const SUMMARY_MESSAGE_TYPE = "dag-plan-summary";
 const NODE_ENTRY_TYPE = "dag-node";
 const MAX_REFINE_ATTEMPTS = 3;
 const STATUS_KEY = "dag-runner";
@@ -53,6 +56,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerMessageRenderer(PLAN_MESSAGE_TYPE, renderPlanMessage);
+	pi.registerMessageRenderer(SUMMARY_MESSAGE_TYPE, renderPlanSummary);
 	pi.registerEntryRenderer(NODE_ENTRY_TYPE, renderNodeCard);
 
 	pi.on("session_shutdown", () => {
@@ -226,14 +230,18 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				r.startedAt !== undefined && r.finishedAt !== undefined ? ` ${formatDuration(r.finishedAt - r.startedAt)}` : "";
 			const usage = formatUsageStats(r.usage);
 			lines.push(`${statusIcon(r.status)} ${r.id} — ${r.title}${dur}${usage ? ` (${usage})` : ""}`);
-			if (r.status === "skipped" && r.skipReason) lines.push(`    ${r.skipReason}`);
-			if (r.status === "failed" && r.error) lines.push(`    ${r.error.split("\n")[0]}`);
+			if (r.status === "skipped" && r.skipReason) {
+				lines.push(`    ${r.skipReason}`);
+			} else {
+				const excerpt = reportExcerpt(r);
+				if (excerpt) lines.push(`    ${excerpt}`);
+			}
 		}
 		lines.push("");
 		lines.push(`Totals: ${formatDuration(durationMs)} · ${formatUsageStats(totalUsage)} · plan: ${shortenHome(planPath)}`);
 
 		pi.sendMessage({
-			customType: "dag-plan-summary",
+			customType: SUMMARY_MESSAGE_TYPE,
 			content: lines.join("\n"),
 			display: true,
 			details: {
@@ -244,6 +252,10 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				skipped,
 				durationMs,
 				usage: totalUsage,
+				// Full per-node reports for the renderer's expanded view (Ctrl+O).
+				// details never reach the LLM; snippets stay in the per-node
+				// "dag-node" entries to avoid duplicating bulky data.
+				results: results.map((r) => ({ ...r, snippets: [] })),
 			},
 		});
 	}

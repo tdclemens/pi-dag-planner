@@ -57,6 +57,17 @@ export function truncate(text: string, maxChars: number): string {
 	return `${text.slice(0, maxChars)}…`;
 }
 
+/**
+ * One-line excerpt of a node's final report: first non-empty line of its
+ * output (the error for failed nodes). Shared by the plan file's Results
+ * table and the post-run summary message so both stay in sync.
+ */
+export function reportExcerpt(result: NodeResult, maxChars = 200): string {
+	const source = result.status === "failed" ? (result.error ?? result.output) : result.output;
+	const firstLine = (source ?? "").split("\n").find((l) => l.trim().length > 0) ?? "";
+	return firstLine ? truncate(firstLine, maxChars) : "";
+}
+
 /** Shorten absolute home paths to ~… for display. */
 export function shortenHome(p: string): string {
 	const home = process.env.HOME ?? "";
@@ -243,6 +254,101 @@ export function renderPlanMessage(
 	}
 
 	box.addChild(new Text(lines.join("\n"), 0, 0));
+	return box;
+}
+
+// ---------------------------------------------------------------------------
+// Post-run summary message renderer (custom message "dag-plan-summary")
+// ---------------------------------------------------------------------------
+
+/**
+ * Details payload of the dag-plan-summary message. `results` carry the full
+ * per-node reports for the expanded view only — the LLM never sees details,
+ * so this costs no context. Snippets are omitted (they live in the per-node
+ * "dag-node" entries; avoid duplicating bulky data in the session file).
+ */
+export interface DagPlanSummaryDetails {
+	planPath: string;
+	status: string;
+	succeeded: number;
+	failed: number;
+	skipped: number;
+	durationMs: number;
+	usage: UsageStats;
+	results: NodeResult[];
+}
+
+/** Full-report cap for the expanded view (matches the plan file's cap). */
+const SUMMARY_REPORT_CAP = 50 * 1024;
+
+/**
+ * Collapsed: the summary text as sent (header + per-node line + excerpt +
+ * totals) plus a Ctrl+O hint. Expanded: each node's full report rendered as
+ * markdown, with plan path and totals.
+ */
+export function renderPlanSummary(
+	message: { content: string | ReadonlyArray<unknown>; details?: unknown },
+	{ expanded, outputPad }: { expanded: boolean; outputPad: number },
+	theme: Theme,
+): Component {
+	const details = message.details as DagPlanSummaryDetails | undefined;
+	const contentText =
+		typeof message.content === "string"
+			? message.content
+			: message.content.map((c) => (c as { text?: string }).text ?? "").join("");
+	const contentLines = contentText.split("\n");
+	const header = contentLines[0] ?? "DAG run";
+	const totalsLine = [...contentLines].reverse().find((l) => l.startsWith("Totals:")) ?? "";
+
+	const box = new Box(outputPad, 1, (t: string) => theme.bg("customMessageBg", t));
+
+	if (!details?.results?.length) {
+		// No structured details (e.g. a session from before this renderer):
+		// fall back to the plain content.
+		box.addChild(new Text(contentText, 0, 0));
+		return box;
+	}
+
+	const container = new Container();
+
+	if (expanded) {
+		container.addChild(new Text(theme.fg("accent", theme.bold(header)), 0, 0));
+		container.addChild(new Text(theme.fg("dim", `plan: ${shortenHome(details.planPath)}`), 0, 0));
+		for (const r of details.results) {
+			container.addChild(new Text("", 0, 0));
+			const dur =
+				r.startedAt !== undefined && r.finishedAt !== undefined ? formatDuration(r.finishedAt - r.startedAt) : "";
+			const usage = formatUsageStats(r.usage, r.model);
+			const meta = [dur, usage].filter(Boolean).join("  ");
+			const head =
+				`${theme.fg(statusColor(r.status), statusIcon(r.status))} ${theme.fg("toolTitle", theme.bold(r.id))}  ${r.title}` +
+				(meta ? theme.fg("muted", `  ${meta}`) : "");
+			container.addChild(new Text(head, 0, 0));
+			if (r.status === "skipped") {
+				container.addChild(new Text(theme.fg("dim", r.skipReason ?? "dependency did not complete"), 0, 0));
+			} else if (r.status === "aborted") {
+				container.addChild(new Text(theme.fg("dim", "aborted before completion"), 0, 0));
+			} else {
+				if (r.error) container.addChild(new Text(theme.fg("error", truncate(r.error, SUMMARY_REPORT_CAP)), 0, 0));
+				container.addChild(new Markdown(truncate(r.output || "(no output)", SUMMARY_REPORT_CAP), 0, 0, getMarkdownTheme()));
+			}
+		}
+		if (totalsLine) {
+			container.addChild(new Text("", 0, 0));
+			container.addChild(new Text(theme.fg("dim", totalsLine), 0, 0));
+		}
+		box.addChild(container);
+		return box;
+	}
+
+	// Collapsed: summary content as sent, header themed, Ctrl+O hint.
+	container.addChild(new Text(theme.fg("accent", theme.bold(header)), 0, 0));
+	for (const l of contentLines.slice(1)) {
+		if (l) container.addChild(new Text(l, 0, 0));
+	}
+	const hasReports = details.results.some((r) => (r.output ?? "").length > 0 || r.error);
+	if (hasReports) container.addChild(new Text(theme.fg("dim", "(Ctrl+O: full reports)"), 0, 0));
+	box.addChild(container);
 	return box;
 }
 

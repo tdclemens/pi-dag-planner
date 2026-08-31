@@ -9,7 +9,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { dependentsIndex } from "./dag.ts";
+import { dependentsIndex, validatePlan } from "./dag.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, UsageStats } from "./types.ts";
 import { addUsage, emptyUsage } from "./types.ts";
 
@@ -107,8 +107,15 @@ export interface RunPlanOptions {
 /**
  * Execute the whole plan. Resolves with one NodeResult per step (in plan
  * order) once every node has ended (done/failed/skipped/aborted).
+ *
+ * Fails fast — before any subagent is spawned — if the plan does not pass
+ * validation (schema shape, known deps, and in particular no cycles):
+ * an invalid plan can never continue.
  */
 export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<NodeResult[]> {
+	const validation = validatePlan(plan);
+	if (!validation.ok) throw new Error(`refusing to execute plan: ${validation.error}`);
+
 	const steps = plan.steps;
 	const maxParallel = Math.max(1, opts.maxParallel ?? getMaxParallel());
 	const onEvent = opts.onEvent ?? (() => {});

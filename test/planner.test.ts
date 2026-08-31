@@ -106,6 +106,19 @@ const validPlanJson = JSON.stringify({
 	],
 });
 
+const cyclicPlanJson = JSON.stringify({
+	goal: "Loop forever",
+	steps: [
+		{ id: "s1", title: "One", prompt: "Do one.", dependsOn: ["s2"] },
+		{ id: "s2", title: "Two", prompt: "Do two.", dependsOn: ["s1"] },
+	],
+});
+
+const malformedPlanJson = JSON.stringify({
+	goal: "Bad ids",
+	steps: [{ id: "Bad ID!", title: "One", prompt: "Do one.", dependsOn: [] }],
+});
+
 /** Minimal ExtensionCommandContext for plan() (model + cwd + thinking). */
 function fakeCtx(): any {
 	return { model: { provider: "test", id: "model" }, cwd: "/tmp/repo", thinkingLevel: undefined };
@@ -250,6 +263,38 @@ test("plan() throws when the planner output is not a valid plan", async () => {
 				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage("I cannot do that.") }]),
 			}),
 			/not a valid plan/,
+		);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() automatically rejects a cyclic plan (schema + cycle check)", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		await assert.rejects(
+			plan(fakeCtx(), "x", {
+				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(cyclicPlanJson) }]),
+			}),
+			/invalid plan: cycle detected: s1 → s2 → s1/,
+		);
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+	}
+});
+
+test("plan() automatically rejects a plan that fails the JSON schema", async () => {
+	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	try {
+		await assert.rejects(
+			plan(fakeCtx(), "x", {
+				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(malformedPlanJson) }]),
+			}),
+			/invalid plan: .*must match/,
 		);
 	} finally {
 		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;

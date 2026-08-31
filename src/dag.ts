@@ -1,53 +1,40 @@
 /**
- * Pure DAG utilities: validation (cycles, missing deps), Kahn topological
- * levels, dependents index. No pi imports — unit-testable on its own.
+ * Pure DAG utilities: validation (JSON schema + graph rules: cycles, missing
+ * deps), Kahn topological levels, dependents index. No pi imports —
+ * unit-testable on its own.
  */
 
-import type { DagNode, DagPlan } from "./types.ts";
+import { validatePlanSchema } from "./schema.ts";
+import type { DagNode, DagPlan, PlanValidation } from "./types.ts";
 
-export type PlanValidation = { ok: true } | { ok: false; error: string };
-
-const ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+export type { PlanValidation };
 
 /**
- * Validate a plan: non-empty steps, unique ids, known deps, no self-deps,
- * acyclic. `plan` may be unknown (from untrusted LLM output) — this returns a
- * structured error instead of throwing.
+ * Validate a plan: first the canonical JSON schema (src/schema.ts — types,
+ * required fields, id pattern, no unknown properties), then the graph rules
+ * the schema cannot express: unique ids, known deps, no self-deps, acyclic.
+ * `plan` may be unknown (from untrusted LLM output) — this returns a
+ * structured error instead of throwing. Rejects plans with cycles, so no
+ * cyclic plan can ever reach the scheduler.
  */
 export function validatePlan(plan: unknown): PlanValidation {
-	if (!plan || typeof plan !== "object") return { ok: false, error: "plan must be an object" };
-	const p = plan as Partial<DagPlan>;
-	if (typeof p.goal !== "string" || !p.goal.trim()) return { ok: false, error: "goal must be a non-empty string" };
-	if (!Array.isArray(p.steps) || p.steps.length === 0) return { ok: false, error: "steps must be a non-empty array" };
+	const schema = validatePlanSchema(plan);
+	if (!schema.ok) return schema;
+	const steps = (plan as DagPlan).steps;
 
 	const seen = new Set<string>();
-	for (let i = 0; i < p.steps.length; i++) {
-		const s = p.steps[i];
-		if (!s || typeof s !== "object") return { ok: false, error: `steps[${i}] must be an object` };
-		const step = s as Partial<DagNode>;
-		if (typeof step.id !== "string" || !step.id.trim())
-			return { ok: false, error: `steps[${i}].id must be a non-empty string` };
-		if (!ID_RE.test(step.id))
-			return { ok: false, error: `steps[${i}].id "${step.id}" must match [a-zA-Z0-9_-] (1-64 chars)` };
+	for (const step of steps) {
 		if (seen.has(step.id)) return { ok: false, error: `duplicate step id "${step.id}"` };
 		seen.add(step.id);
-		if (typeof step.title !== "string" || !step.title.trim())
-			return { ok: false, error: `steps[${i}].title must be a non-empty string` };
-		if (typeof step.prompt !== "string" || !step.prompt.trim())
-			return { ok: false, error: `steps[${i}].prompt must be a non-empty string` };
-		const deps = step.dependsOn ?? [];
-		if (!Array.isArray(deps) || deps.some((d) => typeof d !== "string"))
-			return { ok: false, error: `steps[${i}].dependsOn must be an array of step ids` };
-		for (const d of deps) {
-			if (d === step.id) return { ok: false, error: `step "${step.id}" depends on itself` };
-		}
+		if (step.dependsOn.includes(step.id))
+			return { ok: false, error: `step "${step.id}" depends on itself` };
 	}
-	for (const s of p.steps) {
-		for (const d of s.dependsOn ?? []) {
+	for (const s of steps) {
+		for (const d of s.dependsOn) {
 			if (!seen.has(d)) return { ok: false, error: `step "${s.id}" depends on unknown id "${d}"` };
 		}
 	}
-	const cycle = findCycle(p.steps);
+	const cycle = findCycle(steps);
 	if (cycle) return { ok: false, error: `cycle detected: ${cycle.join(" → ")}` };
 	return { ok: true };
 }

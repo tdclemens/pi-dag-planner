@@ -22,6 +22,9 @@ export interface DagPlan {
 	steps: DagNode[];
 }
 
+/** Result of validating a plan (schema + graph rules). */
+export type PlanValidation = { ok: true } | { ok: false; error: string };
+
 export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped" | "aborted";
 
 /** Per-node (and aggregate) token/cost accounting. */

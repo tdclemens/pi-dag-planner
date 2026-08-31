@@ -1,7 +1,9 @@
 /**
  * Planner: explores the repo as a read-only pi subagent (default) or makes a
  * single blind LLM call (DAG_PLAN_PLANNER_EXPLORE=0), then robust JSON
- * extraction and plan validation. `extractPlanJson` is pure and unit-testable.
+ * extraction and automatic validation of the plan against the canonical
+ * JSON schema (src/schema.ts) plus the acyclicity rule. `extractPlanJson`
+ * is pure and unit-testable.
  */
 
 import type { ChildProcess } from "node:child_process";
@@ -15,8 +17,10 @@ import { emptyUsage } from "./types.ts";
 
 /**
  * Default planner system prompt: the planner is a read-only agent that may
- * explore the repository before emitting the plan JSON. JSON schema below is
- * the output contract consumed by extractPlanJson/validatePlan.
+ * explore the repository before emitting the plan JSON. The JSON shape below
+ * is the output contract consumed by extractPlanJson/validatePlan (the
+ * canonical schema lives in src/schema.ts; the plan is validated
+ * automatically before it can be saved or executed).
  */
 export const PLANNER_SYSTEM_PROMPT = `You are a DAG planner with read-only repository tools. Your output is a plan that isolated coding subagents will execute in parallel. The plan must be executable to completion and produce a working, verified result for the user's request.
 

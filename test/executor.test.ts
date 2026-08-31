@@ -402,6 +402,50 @@ test("runPlan passes the original request into every node prompt", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Pre-execution validation gate (schema + acyclicity)
+// ---------------------------------------------------------------------------
+
+test("runPlan rejects a cyclic plan before spawning anything", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("a", ["b"]), node("b", ["a"]), node("c")] };
+	const h = makeHarness();
+	await assert.rejects(
+		runPlan(plan, { cwd: process.cwd(), signal: new AbortController().signal, spawnImpl: h.spawnImpl }),
+		/refusing to execute plan: cycle detected: a → b → a/,
+	);
+	assert.equal(h.spawns.length, 0, "no subagent may start for a cyclic plan");
+});
+
+test("runPlan rejects a self-looping plan before spawning anything", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("a", ["a"])] };
+	const h = makeHarness();
+	await assert.rejects(
+		runPlan(plan, { cwd: process.cwd(), signal: new AbortController().signal, spawnImpl: h.spawnImpl }),
+		/refusing to execute plan: .* depends on itself/,
+	);
+	assert.equal(h.spawns.length, 0);
+});
+
+test("runPlan rejects a plan with an unknown dependency before spawning anything", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("a", ["ghost"])] };
+	const h = makeHarness();
+	await assert.rejects(
+		runPlan(plan, { cwd: process.cwd(), signal: new AbortController().signal, spawnImpl: h.spawnImpl }),
+		/refusing to execute plan: .*unknown id/,
+	);
+	assert.equal(h.spawns.length, 0);
+});
+
+test("runPlan rejects a schema-malformed plan before spawning anything", async () => {
+	const plan = { goal: "g", steps: [{ ...node("a"), id: "Bad ID!" }] } as unknown as DagPlan;
+	const h = makeHarness();
+	await assert.rejects(
+		runPlan(plan, { cwd: process.cwd(), signal: new AbortController().signal, spawnImpl: h.spawnImpl }),
+		/refusing to execute plan: .*must match/,
+	);
+	assert.equal(h.spawns.length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // runPiSubagent (shared runner: executor nodes + exploring planner)
 // ---------------------------------------------------------------------------
 

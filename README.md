@@ -26,13 +26,13 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[] }] }`. Each step prompt is self-contained because subagents have no shared context.
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[] }] }`. Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback.
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
    - **Reject** — the plan file is kept for reference
 3. **Save** — before execution, the plan is written to `~/.agents/plans/<timestamp>-<slug>.md` with the human-readable step list and the exact JSON embedded.
-4. **Execute** — the DAG is scheduled with Kahn's algorithm: a worker pool (default 4, bounded by `DAG_PLAN_MAX_PARALLEL`) runs every node whose dependencies are complete, so independent branches execute concurrently. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes.
+4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, bounded by `DAG_PLAN_MAX_PARALLEL`) runs every node whose dependencies are complete, so independent branches execute concurrently. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes.
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
@@ -148,7 +148,8 @@ Totals: 4/4 succeeded · $0.0712 · 2m03s
 src/
 ├── index.ts     # /dag-plan command, message/entry renderers, flow orchestration
 ├── planner.ts   # planner prompt, LLM call, robust JSON extraction + validation
-├── dag.ts       # pure DAG utils: validation (cycles, deps), topological levels
+├── schema.ts    # canonical JSON Schema for the plan (2020-12) + ajv validation
+├── dag.ts       # pure DAG utils: schema + graph validation (cycles, deps), topo levels
 ├── executor.ts  # ready-set scheduler + pi subprocess subagents + JSONL parsing
 ├── ui.ts        # plan renderer, node result cards, live runner dashboard, snippets
 ├── plans.ts     # ~/.agents/plans/ markdown writer (plan + results append)
@@ -158,8 +159,8 @@ src/
 ## Development
 
 ```bash
-npm install        # dev dependencies only (typescript, test runner)
-npm test           # unit tests: DAG validation, JSON extraction, scheduler
+npm install        # dependencies (typescript, ajv, test runner)
+npm test           # unit tests: schema + DAG validation, JSON extraction, scheduler
 ```
 
 Manual smoke test:

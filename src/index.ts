@@ -15,6 +15,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { runPlan } from "./executor.ts";
 import { plan, plannerExplores, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
 import * as plans from "./plans.ts";
@@ -38,7 +39,6 @@ const SUMMARY_MESSAGE_TYPE = "dag-plan-summary";
 const NODE_ENTRY_TYPE = "dag-node";
 const MAX_REFINE_ATTEMPTS = 3;
 const STATUS_KEY = "dag-runner";
-const PLANNER_STATUS_KEY = "dag-planner";
 
 type PlanPhaseOutcome = { ok: true; result: PlannerResult } | { ok: false; error: string };
 
@@ -283,13 +283,19 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				? `Planning with ${modelLabel} (exploring repo)…`
 				: `Planning with ${modelLabel}…`;
 			const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
+			// Planner tool activity renders inside the loader box (not the
+			// status bar): a line inserted right after the label, updated in
+			// place as the subagent calls read/grep/find/ls. An empty Text
+			// renders zero rows, so the box is unchanged until the first
+			// snippet arrives.
+			const snippetLine = new Text("", 3, 0);
+			loader.children.splice(2, 0, snippetLine);
 			// Guard: Esc calls done(null) while the (killed) planner subagent may
 			// still settle the promise afterwards — done() must run exactly once.
 			let settled = false;
 			const finish = (outcome: PlanPhaseOutcome | null) => {
 				if (settled) return;
 				settled = true;
-				ctx.ui.setStatus(PLANNER_STATUS_KEY, undefined);
 				done(outcome);
 			};
 			loader.onAbort = () => finish(null);
@@ -299,7 +305,10 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				{
 					feedback,
 					priorPlanJson: priorJson,
-					onExplore: (snippet) => ctx.ui.setStatus(PLANNER_STATUS_KEY, `planning: ${snippet}`),
+					onExplore: (snippet) => {
+						snippetLine.setText(theme.fg("muted", snippet));
+						tui.requestRender();
+					},
 				},
 				loader.signal,
 			)

@@ -66,7 +66,8 @@ export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: Pla
 	lines.push(`- **Steps:** ${plan.steps.length} (waves: ${waveDesc})`);
 	lines.push("", "## Steps", "");
 	plan.steps.forEach((s, i) => {
-		lines.push(`${i + 1}. **${s.id}** — ${s.title} — deps: ${s.dependsOn.length > 0 ? s.dependsOn.join(", ") : "—"}`);
+		const touches = s.touches && s.touches.length > 0 ? ` — touches: ${s.touches.join(", ")}` : "";
+		lines.push(`${i + 1}. **${s.id}** — ${s.title} — deps: ${s.dependsOn.length > 0 ? s.dependsOn.join(", ") : "—"}${touches}`);
 	});
 	lines.push("", "## Plan (JSON)", "", "```json", JSON.stringify(plan, null, 2), "```", "");
 	return lines.join("\n");

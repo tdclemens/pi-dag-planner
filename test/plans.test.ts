@@ -27,3 +27,21 @@ test("renderPlanMarkdown omits the duration line when unknown", () => {
 	assert.ok(!md.includes("**Planned in:**"), md);
 	assert.ok(md.includes("- **Status:** pending"), md);
 });
+
+test("renderPlanMarkdown lists touches on step lines only when declared", () => {
+	const planWithTouches: DagPlan = {
+		goal: "g",
+		steps: [
+			{ id: "a", title: "A", prompt: "p", dependsOn: [], touches: ["src/a.ts", "package-lock.json"] },
+			{ id: "b", title: "B", prompt: "p", dependsOn: ["a"] },
+		],
+	};
+	const md = renderPlanMarkdown(planWithTouches, "raw", "pending");
+	assert.ok(md.includes("1. **a** — A — deps: — — touches: src/a.ts, package-lock.json"), md);
+	assert.ok(md.includes("2. **b** — B — deps: a"), md);
+	assert.ok(!/\*\*b\*\*[^\n]*touches/.test(md), "step without touches has no touches suffix");
+	// The embedded JSON keeps touches too (resume source of truth).
+	const jsonSection = md.slice(md.indexOf("```json"));
+	assert.ok(jsonSection.includes('"touches"'), md);
+	assert.ok(jsonSection.includes('"src/a.ts"') && jsonSection.includes('"package-lock.json"'), md);
+});

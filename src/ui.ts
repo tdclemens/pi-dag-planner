@@ -199,6 +199,8 @@ export interface DagPlanDetails {
 	planPath: string;
 	/** Wall-clock time of the DAG Plan phase (incl. retries), if known. */
 	planDurationMs?: number;
+	/** Non-fatal validation warnings (e.g. unordered touches overlap). */
+	warnings?: string[];
 }
 
 export function renderPlanMessage(
@@ -241,6 +243,15 @@ export function renderPlanMessage(
 			lines.push(`  ${theme.fg("muted", "●")} ${theme.fg("toolTitle", node.id.padEnd(maxIdLen))}  ${node.title}${deps}`);
 		}
 	});
+
+	if (details.warnings?.length) {
+		for (const w of details.warnings.slice(0, 5)) {
+			lines.push(theme.fg("warning", `  ⚠ ${truncate(w, 160)}`));
+		}
+		if (details.warnings.length > 5) {
+			lines.push(theme.fg("dim", `  … ${details.warnings.length - 5} more warning(s)`));
+		}
+	}
 
 	if (expanded) {
 		lines.push("");
@@ -418,6 +429,8 @@ interface DashboardRow {
 	snippet?: ToolSnippet;
 	startedAt?: number;
 	finishedAt?: number;
+	/** File-lock serialization: this pending node waits on the resource. */
+	blockedBy?: { resource: string; heldBy: string };
 }
 
 export class RunDashboard implements Component {
@@ -444,14 +457,24 @@ export class RunDashboard implements Component {
 	}
 
 	/** Update state from an executor event; safe to call from any thread context. */
-	update(event: { type: string; nodeId?: string; snippet?: ToolSnippet; result?: NodeResult }): void {
+	update(event: {
+		type: string;
+		nodeId?: string;
+		snippet?: ToolSnippet;
+		result?: NodeResult;
+		resource?: string;
+		heldBy?: string;
+	}): void {
 		const row = event.nodeId ? this.rows.get(event.nodeId) : undefined;
 		if (!row) return;
 		if (event.type === "node-start") {
 			row.status = "running";
 			row.startedAt = Date.now();
+			row.blockedBy = undefined;
 		} else if (event.type === "snippet" && event.snippet) {
 			row.snippet = event.snippet;
+		} else if (event.type === "node-blocked" && event.resource && event.heldBy) {
+			row.blockedBy = { resource: event.resource, heldBy: event.heldBy };
 		} else if (event.type === "node-end" && event.result) {
 			row.status = event.result.status;
 			row.startedAt = event.result.startedAt ?? row.startedAt;
@@ -535,7 +558,14 @@ export class RunDashboard implements Component {
 						const dep = this.rows.get(d);
 						return dep && (dep.status === "pending" || dep.status === "running");
 					});
-					const wait = waiting.length > 0 ? t.fg("dim", `  (waiting: ${waiting.join(", ")})`) : "";
+					let wait: string;
+					if (waiting.length > 0) {
+						wait = t.fg("dim", `  (waiting: ${waiting.join(", ")})`);
+					} else if (row.blockedBy) {
+						wait = t.fg("warning", `  (file lock: ${row.blockedBy.resource} held by ${row.blockedBy.heldBy})`);
+					} else {
+						wait = "";
+					}
 					line = `${glyph} ${id}  ${t.fg("dim", node.title)}${wait}`;
 				}
 			}

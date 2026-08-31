@@ -16,6 +16,12 @@ export type { PlanValidation };
  * `plan` may be unknown (from untrusted LLM output) — this returns a
  * structured error instead of throwing. Rejects plans with cycles, so no
  * cyclic plan can ever reach the scheduler.
+ *
+ * Non-fatal: unordered `touches` overlap (two steps may modify the same
+ * file without a dependency between them) does NOT reject the plan — the
+ * executor serializes those steps at run time — but it is reported as a
+ * warning so the user sees the implied loss of parallelism before
+ * approving.
  */
 export function validatePlan(plan: unknown): PlanValidation {
 	const schema = validatePlanSchema(plan);
@@ -36,7 +42,61 @@ export function validatePlan(plan: unknown): PlanValidation {
 	}
 	const cycle = findCycle(steps);
 	if (cycle) return { ok: false, error: `cycle detected: ${cycle.join(" → ")}` };
-	return { ok: true };
+	const warnings = touchesOverlapWarnings(steps);
+	return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+}
+
+/**
+ * One warning per unordered pair of steps sharing a `touches` entry. A pair
+ * is "ordered" when one step transitively depends on the other. Plans with
+ * no `touches` declarations produce no warnings (the planner prompt asks
+ * for them; older/external plans may lack them).
+ */
+export function touchesOverlapWarnings(steps: DagNode[]): string[] {
+	const byResource = new Map<string, string[]>();
+	for (const s of steps) {
+		for (const t of new Set(s.touches ?? [])) {
+			const list = byResource.get(t) ?? [];
+			list.push(s.id);
+			byResource.set(t, list);
+		}
+	}
+	if (byResource.size === 0) return [];
+	const deps = transitiveDepClosure(steps);
+	const warnings: string[] = [];
+	for (const [resource, ids] of byResource) {
+		for (let i = 0; i < ids.length; i++) {
+			for (let j = i + 1; j < ids.length; j++) {
+				const a = ids[i]!;
+				const b = ids[j]!;
+				const ordered = (deps.get(a)?.has(b) ?? false) || (deps.get(b)?.has(a) ?? false);
+				if (!ordered)
+					warnings.push(
+						`steps "${a}" and "${b}" both touch ${JSON.stringify(resource)} but are not ordered by a dependency; they will be serialized by the file lock`,
+					);
+			}
+		}
+	}
+	return warnings;
+}
+
+/** id -> set of all transitive prerequisite ids. Assumes an acyclic plan. */
+function transitiveDepClosure(steps: DagNode[]): Map<string, Set<string>> {
+	const byId = new Map(steps.map((s) => [s.id, s]));
+	const memo = new Map<string, Set<string>>();
+	const visit = (id: string): Set<string> => {
+		const cached = memo.get(id);
+		if (cached) return cached;
+		const out = new Set<string>();
+		for (const d of byId.get(id)?.dependsOn ?? []) {
+			out.add(d);
+			for (const t of visit(d)) out.add(t);
+		}
+		memo.set(id, out);
+		return out;
+	};
+	for (const s of steps) visit(s.id);
+	return memo;
 }
 
 /** DFS cycle detection; returns one cycle path (ending back at its start, e.g. [a,b,c,a]) or null. */

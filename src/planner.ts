@@ -38,6 +38,7 @@ Then respond with ONLY a JSON object — no prose, no markdown fences — matchi
       "title": "Short human label for this step",
       "prompt": "Self-contained task instructions for the subagent executing this step…",
       "dependsOn": [],
+      "touches": ["src/example.ts", "package-lock.json"],
       "tools": ["read", "grep", "find", "ls"]
     }
   ]
@@ -47,6 +48,7 @@ Rules:
 - 3-8 steps. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
 - Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Exception: steps that modify the same file or resource MUST be ordered with an edge — parallel steps must touch disjoint files.
+- "touches" is required for every step that creates or modifies anything: list the exact file paths (relative to the repo root) the step will write, plus the shared resources its commands mutate. npm/pnpm install → include "package-lock.json" and "node_modules"; a formatter → the files it rewrites; a dev server or test database → a named resource like "ports:3000" or "test-db". Read-only steps use []. Steps whose touches overlap are hard-serialized by the executor; when two steps must touch the same file, add a dependsOn edge so the order is explicit in the plan (and still list the overlap in touches).
 - Each "prompt" must be self-contained — subagents share NO conversation context and do NOT see this planning session (they see the one-line goal, the user's original request, their step prompt, and the final reports of their prerequisite steps, truncated to ~8KB each). State the goal, the concrete task, the exact file paths and commands (use the ones you verified during exploration), the expected artifacts, and end with an explicit report instruction: "Report: <the exact artifacts — file paths, commands, values> later steps need." A step's final message is the only thing its dependents receive.
 - Complete coverage: every part of the user's request must be produced or addressed by at least one step; after the last step the repository must satisfy the request as a whole. Do not silently drop requirements.
 - Verification is required: if any step changes code, config, or files, the plan must end with a verification step that runs the project's real checks (the exact test/build/typecheck commands you found during exploration) and fixes any failures it causes until green; if the project has no checks, it must instead run a meaningful smoke check (start the app, run the CLI, or import the module) and report the observed output.
@@ -69,6 +71,7 @@ Respond with ONLY a JSON object — no prose, no markdown fences — matching ex
       "title": "Short human label for this step",
       "prompt": "Self-contained task instructions for the subagent executing this step…",
       "dependsOn": [],
+      "touches": ["src/example.ts"],
       "tools": ["read", "grep", "find", "ls"]
     }
   ]
@@ -77,6 +80,7 @@ Respond with ONLY a JSON object — no prose, no markdown fences — matching ex
 Rules:
 - 3-8 steps. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
+- "touches" (required for steps that modify anything): the exact file paths the step creates or modifies, plus shared resources its commands mutate (lockfiles, build dirs, ports); read-only steps use []. Overlapping touches are serialized at run time — keep them disjoint or order the steps with dependsOn.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
 - The last step(s) should verify the work (run tests, build, or report findings).`;
 
@@ -164,7 +168,17 @@ export function normalizePlan(value: unknown): DagPlan | null {
 			typeof s.title === "string" && s.title.trim() ? s.title.trim() : (s.prompt.split("\n")[0] ?? "").slice(0, 60) || id;
 		const dependsOn = Array.isArray(s.dependsOn) ? s.dependsOn.filter((d): d is string => typeof d === "string") : [];
 		const tools = Array.isArray(s.tools) ? s.tools.filter((t): t is string => typeof t === "string") : undefined;
-		steps.push({ id, title, prompt: s.prompt, dependsOn, ...(tools && tools.length > 0 ? { tools } : {}) });
+		const touches = Array.isArray(s.touches)
+			? s.touches.filter((t): t is string => typeof t === "string").map((t) => t.trim()).filter((t) => t.length > 0)
+			: undefined;
+		steps.push({
+			id,
+			title,
+			prompt: s.prompt,
+			dependsOn,
+			...(tools && tools.length > 0 ? { tools } : {}),
+			...(touches && touches.length > 0 ? { touches } : {}),
+		});
 	}
 	return { goal: v.goal.trim(), steps };
 }

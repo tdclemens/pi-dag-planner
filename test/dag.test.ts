@@ -79,11 +79,72 @@ test("validatePlan rejects plans that fail the schema", () => {
 		{ goal: "g", steps: [{ ...node("a"), id: "Bad ID!" }] },
 		{ goal: "g", steps: [{ ...node("a"), dependsOn: null }] },
 		{ goal: "g", steps: [{ ...node("a"), tools: "read" }] },
+		{ goal: "g", steps: [{ ...node("a"), touches: "src/a.ts" }] },
+		{ goal: "g", steps: [{ ...node("a"), touches: [""] }] },
+		{ goal: "g", steps: [{ ...node("a"), touches: ["x", "x"] }] },
 	];
 	for (const p of bad) {
 		const v = validatePlan(p);
 		assert.equal(v.ok, false, `expected rejection: ${JSON.stringify(p)}`);
 	}
+	const good = validatePlan({ goal: "g", steps: [{ ...node("a"), touches: ["src/a.ts", "ports:3000"] }] });
+	assert.equal(good.ok, true, "well-formed touches are accepted");
+});
+
+test("validatePlan warns (but still ok) when unordered steps share a touches entry", () => {
+	const v = validatePlan({
+		goal: "g",
+		steps: [
+			{ ...node("a"), touches: ["src/app.ts"] },
+			{ ...node("b"), touches: ["src/app.ts"] },
+		],
+	});
+	assert.equal(v.ok, true);
+	if (v.ok) {
+		assert.equal(v.warnings?.length, 1);
+		assert.match(v.warnings[0]!, /"a" and "b"/);
+		assert.match(v.warnings[0]!, /src\/app\.ts/);
+	}
+});
+
+test("validatePlan does not warn when overlapping touches are ordered (direct or transitive)", () => {
+	const direct = validatePlan({
+		goal: "g",
+		steps: [{ ...node("a"), touches: ["x"] }, { ...node("b", ["a"]), touches: ["x"] }],
+	});
+	assert.ok(direct.ok && (direct.warnings ?? []).length === 0);
+	const transitive = validatePlan({
+		goal: "g",
+		steps: [
+			{ ...node("a"), touches: ["x"] },
+			{ ...node("b", ["a"]) },
+			{ ...node("c", ["b"]), touches: ["x"] },
+		],
+	});
+	assert.ok(transitive.ok && (transitive.warnings ?? []).length === 0);
+});
+
+test("validatePlan warns per unordered pair per resource", () => {
+	const v = validatePlan({
+		goal: "g",
+		steps: [
+			{ ...node("a"), touches: ["x", "y"] },
+			{ ...node("b"), touches: ["x"] },
+			{ ...node("c"), touches: ["y"] },
+		],
+	});
+	assert.ok(v.ok);
+	const warnings = v.warnings ?? [];
+	assert.equal(warnings.length, 2, "(a,b) on x and (a,c) on y");
+	assert.ok(warnings.some((w) => w.includes('"a"') && w.includes('"b"') && w.includes('"x"')));
+	assert.ok(warnings.some((w) => w.includes('"a"') && w.includes('"c"') && w.includes('"y"')));
+});
+
+test("validatePlan: no touches declarations → no warnings (back-compat)", () => {
+	const v = validatePlan({ goal: "g", steps: [node("a"), node("b")] });
+	assert.ok(v.ok && (v.warnings ?? []).length === 0);
+	const v2 = validatePlan({ goal: "g", steps: [{ ...node("a"), touches: [] }] });
+	assert.ok(v2.ok && (v2.warnings ?? []).length === 0);
 });
 
 test("validatePlan rejects duplicate ids", () => {

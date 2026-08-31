@@ -81,6 +81,18 @@ test("normalizePlan filters non-string dependsOn/tools entries", () => {
 	assert.deepEqual(p.steps[0].tools, ["read"]);
 });
 
+test("normalizePlan carries touches through (trimmed, non-strings/blank filtered, absent when empty)", () => {
+	const p = normalizePlan({
+		goal: "G",
+		steps: [{ id: "s1", title: "T", prompt: "P", touches: ["a.ts", "  ", 42, " package-lock.json "] }],
+	});
+	assert.ok(p);
+	assert.deepEqual(p.steps[0].touches, ["a.ts", "package-lock.json"]);
+	const p2 = normalizePlan({ goal: "G", steps: [{ id: "s1", title: "T", prompt: "P" }] });
+	assert.ok(p2);
+	assert.equal(p2.steps[0].touches, undefined, "no key when the model omitted touches");
+});
+
 test("normalizePlan rejects non-plan shapes", () => {
 	assert.equal(normalizePlan(null), null);
 	assert.equal(normalizePlan({ steps: [] }), null);
@@ -173,12 +185,16 @@ test("buildPlannerArgs omits --thinking when undefined", () => {
 	assert.ok(!buildPlannerArgs("p/m").includes("--thinking"));
 });
 
-test("agentic prompt requires exploration + verification; blind prompt stays JSON-only", () => {
+test("agentic prompt requires exploration + verification; both prompts contract on touches", () => {
 	assert.match(PLANNER_SYSTEM_PROMPT, /explore the repository/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /read-only/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /verification is required/i);
 	assert.match(PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
+	assert.match(PLANNER_SYSTEM_PROMPT, /"touches"/);
+	assert.match(PLANNER_SYSTEM_PROMPT, /package-lock\.json/, "shared resources (lockfiles) must be declared");
 	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
+	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /"touches"/);
+	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /serialized at run time/);
 });
 
 test("plannerExplores env parsing (on by default)", () => {

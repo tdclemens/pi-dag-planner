@@ -8,6 +8,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { dependentsIndex, validatePlan } from "./dag.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, UsageStats } from "./types.ts";
@@ -19,6 +20,14 @@ const DEP_OUTPUT_TOTAL_CAP = 16 * 1024;
 const MAX_SNIPPETS = 200;
 const KILL_GRACE_MS = 5000;
 const STDERR_CAP = 2000;
+
+/**
+ * Per-node file-lock extension (src/lock-guard.ts), loaded into every node
+ * subagent via `-e` + the DAG_NODE_ID env var. It vetoes writes to files
+ * that changed since the node last read them (undeclared overlap safety net;
+ * declared overlap is serialized by the touches mutex in runPlan).
+ */
+const LOCK_GUARD_PATH = fileURLToPath(new URL("./lock-guard.ts", import.meta.url));
 
 /** Concurrency from DAG_PLAN_MAX_PARALLEL (registerFlag is bool/string only). */
 export function getMaxParallel(): number {
@@ -82,6 +91,8 @@ export function buildTaskPrompt(
 	}
 	lines.push(
 		"",
+		"Other steps of this plan may be running at the same time in this same repository. If a write or edit is rejected because the file changed since you last read it (DAG file lock), re-read the file and re-apply your change against the fresh content. If the same file keeps conflicting, do the rest of your task and report the conflict instead of retrying it.",
+		"",
 		"When finished, reply with a concise markdown report: what you did, and the artifacts (file paths, commands, values) that later steps need.",
 	);
 	return lines.join("\n");
@@ -125,6 +136,16 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 	const results = new Map<string, NodeResult>();
 	const doneIds = new Set<string>();
 	const running = new Set<Promise<void>>();
+	// Declared-resource mutex: resource -> id of the running node holding it.
+	// A node holds its declared `touches` for the whole run, so two nodes
+	// whose touches overlap never run simultaneously (coarse on purpose — a
+	// node holds a file for the entire session, which is predictable and
+	// needs no LLM retry loops). Undeclared overlap is caught at write time
+	// by the lock-guard extension instead.
+	const heldResources = new Map<string, string>();
+	// nodeId -> last node-blocked info emitted, so the UI event fires only
+	// when the blocking resource/holder changes, not every scheduler tick.
+	const blockedInfo = new Map<string, { resource: string; heldBy: string }>();
 
 	function emitEnd(nodeId: string, result: NodeResult): void {
 		results.set(nodeId, result);
@@ -183,8 +204,29 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 		const ready = steps.filter(
 			(s) => status.get(s.id) === "pending" && s.dependsOn.every((d) => doneIds.has(d)),
 		);
-		const slots = maxParallel - running.size;
-		for (const node of ready.slice(0, Math.max(0, slots))) {
+		let slots = Math.max(0, maxParallel - running.size);
+		for (const node of ready) {
+			if (slots <= 0) break;
+			const conflict = (node.touches ?? []).find((t) => heldResources.has(t));
+			if (conflict !== undefined) {
+				// A running node holds one of this node's declared resources:
+				// stay pending until it finishes (ready nodes are re-scanned
+				// after every node end, so this always makes progress — a
+				// blocked node never holds anything itself, so no deadlock).
+				const heldBy = heldResources.get(conflict)!;
+				const prev = blockedInfo.get(node.id);
+				if (!prev || prev.resource !== conflict || prev.heldBy !== heldBy) {
+					blockedInfo.set(node.id, { resource: conflict, heldBy });
+					onEvent({ type: "node-blocked", nodeId: node.id, resource: conflict, heldBy });
+				}
+				continue;
+			}
+			blockedInfo.delete(node.id);
+			// Atomic claim: the loop is synchronous, so check-then-set cannot
+			// interleave with another start. All-or-nothing is implicit —
+			// `conflict` above already verified every touch is free.
+			for (const t of node.touches ?? []) heldResources.set(t, node.id);
+			slots--;
 			const p = executeNode(node).catch(() => {
 				// Defensive: executeNode should not reject.
 				if (!results.has(node.id)) {
@@ -201,7 +243,12 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 				}
 			});
 			running.add(p);
-			void p.finally(() => running.delete(p));
+			void p.finally(() => {
+				running.delete(p);
+				for (const t of node.touches ?? []) {
+					if (heldResources.get(t) === node.id) heldResources.delete(t);
+				}
+			});
 		}
 		if (running.size === 0) break;
 		await Promise.race([...running]);
@@ -251,8 +298,10 @@ export interface PiSubagentOptions {
 	prompt: string;
 	/** Live tool-call observation (UI snippets / status line). */
 	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
-	/** Test seam: replace the subprocess spawn. */
-	spawnImpl?: (command: string, args: string[], cwd: string) => ChildProcess;
+	/** Extra env for the child, merged over process.env (e.g. DAG_NODE_ID). */
+	env?: Record<string, string>;
+	/** Test seam: replace the subprocess spawn. The env arg is optional for fakes. */
+	spawnImpl?: (command: string, args: string[], cwd: string, env?: Record<string, string>) => ChildProcess;
 }
 
 /**
@@ -304,11 +353,12 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 		let proc: ChildProcess;
 		try {
 			const invocation = getPiInvocation([...opts.args, opts.prompt]);
+			const childEnv = opts.env ? { ...process.env, ...opts.env } : process.env;
 			const spawnImpl =
 				opts.spawnImpl ??
 				((command: string, a: string[], cwd: string) =>
-					spawn(command, a, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] }));
-			proc = spawnImpl(invocation.command, invocation.args, opts.cwd);
+					spawn(command, a, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"], env: childEnv }));
+			proc = spawnImpl(invocation.command, invocation.args, opts.cwd, opts.env);
 		} catch (e) {
 			result.stderr = `failed to spawn subagent: ${e instanceof Error ? e.message : String(e)}`;
 			resolve(1);
@@ -382,7 +432,7 @@ async function runNodeSubagent(
 	}
 	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt);
 
-	const args: string[] = ["--mode", "json", "-p", "--no-session"];
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "-e", LOCK_GUARD_PATH];
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
 	if (node.tools && node.tools.length > 0) args.push("--tools", node.tools.join(","));
@@ -403,6 +453,7 @@ async function runNodeSubagent(
 		args,
 		prompt: task,
 		spawnImpl: opts.spawnImpl,
+		env: { DAG_NODE_ID: node.id },
 		onToolCall: (toolName, argsObj) => {
 			if (result.snippets.length < MAX_SNIPPETS) {
 				result.snippets.push({ toolName, args: argsObj });

@@ -26,13 +26,13 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[] }] }`. Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback.
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card.
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
    - **Reject** — the plan file is kept for reference
 3. **Save** — before execution, the plan is written to `~/.agents/plans/<timestamp>-<slug>.md` with the human-readable step list and the exact JSON embedded.
-4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, bounded by `DAG_PLAN_MAX_PARALLEL`) runs every node whose dependencies are complete, so independent branches execute concurrently. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes.
+4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, bounded by `DAG_PLAN_MAX_PARALLEL`) runs every node whose dependencies are complete, so independent branches execute concurrently. **Declared `touches` are mutex-protected at the scheduler**: a node holds its declared files/resources for the whole run, and a ready node whose touches collide with a running one stays pending (shown in the runner panel) until the holder finishes — no two nodes ever write the same declared file at the same time. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes, with the per-node file-lock extension (`src/lock-guard.ts`) injected via `-e` + `DAG_NODE_ID` to catch *undeclared* overlap at write time (see below).
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
@@ -45,7 +45,17 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
    When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. **Esc** cancels the run (children are terminated, state is finalized).
 
-   Node status icons (single-cell, non-emoji, so the column aligns in any terminal): `○` pending · `▶` running · `✓` done · `✗` failed · `⊘` skipped · `■` aborted. Usage lines show `↑` input tokens, `↓` output tokens, `R`/`W` cache read/write, then cost and model.
+   Node status icons (single-cell, non-emoji, so the column aligns in any terminal): `○` pending · `▶` running · `✓` done · `✗` failed · `⊘` skipped · `■` aborted. Usage lines show `↑` input tokens, `↓` output tokens, `R`/`W` cache read/write, then cost and model. A pending node waiting on the file lock shows why: `○ s4  Run tests (file lock: package-lock.json held by s1)`.
+
+## Concurrent file conflicts
+
+Nodes run as parallel subagents **in the same working directory**, so two nodes writing the same file is the classic corruption risk (last writer silently wins). `pi-dag-plan` layers three defenses:
+
+1. **Planner contract** — every step declares `touches`: the exact files it creates/modifies *plus* the shared resources its commands mutate (lockfiles, `node_modules`, build dirs, ports, test DBs). The planner is instructed to keep `touches` disjoint across parallel steps and to add a `dependsOn` edge when two steps must share a file. `validatePlan` warns (⚠ on the plan card, before you approve) when unordered steps share a `touches` entry, so implied serialization is visible, not silent.
+2. **Executor resource mutex** — `touches` are scheduler-level locks: a node acquires all of its declared resources when it starts and releases them when it ends; a ready node whose touches collide stays pending (and the runner panel names the resource and the holder). Undeclared nodes never block, so this only ever *reduces* overlap, never deadlocks (a blocked node holds nothing).
+3. **Per-node file lock (optimistic concurrency)** — every node subagent loads `src/lock-guard.ts`, which hashes each file the node reads and vetoes `write`/`edit` calls whose target changed since that read: the tool call is blocked with an instruction to **re-read and re-apply**. After 3 stale retries on one file the node is told to stop touching it and report the conflict, so a hot file cannot burn the run in a retry loop. This is detect-and-retry, not a held lock — an agent thinks for minutes between read and write, so pessimistic locking would serialize everything. It catches overlap the planner failed to declare (including files rewritten by another node's *bash* commands).
+
+Known gap: writes done purely through `bash` (e.g. `npm install` regenerating a lockfile) are not intercepted — declare them as `touches` so the executor serializes the owning steps, and the file lock will at least make any such collision *visible* to the affected node (one extra re-read).
 
 ## Install
 
@@ -177,3 +187,4 @@ pi -e ./src/index.ts
 - A failed node skips its dependents; the rest of the graph continues. (Interactive retry of a failed node is planned.)
 - Subagent sessions are ephemeral (`--no-session`); the transcript cards, results table, and plan file are the durable record, with large outputs truncated.
 - No resume of an interrupted run — re-plan with `/dag-plan` if you need to continue.
+- The file lock covers the `read`/`write`/`edit` tools only; `bash`-mediated file mutations are not intercepted (see [Concurrent file conflicts](#concurrent-file-conflicts)).

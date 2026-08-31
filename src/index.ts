@@ -18,6 +18,7 @@ import {
 import { runPlan } from "./executor.ts";
 import { plan, plannerExplores, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
 import * as plans from "./plans.ts";
+import { validatePlan } from "./dag.ts";
 import type { DagEvent, NodeResult, PlannerResult } from "./types.ts";
 import { addUsage } from "./types.ts";
 import {
@@ -330,11 +331,15 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				return null;
 			}
 			if (ctx.signal?.aborted) return null;
+			// Non-fatal validation warnings (e.g. unordered touches overlap →
+			// implied serialization) are shown with the plan for review.
+			const v = validatePlan(result.plan);
+			const warnings = v.ok ? v.warnings : undefined;
 			pi.sendMessage({
 				customType: PLAN_MESSAGE_TYPE,
 				content: `DAG Plan — ${result.plan.goal} (${result.plan.steps.length} steps)`,
 				display: true,
-				details: { plan: result.plan, planPath, planDurationMs },
+				details: { plan: result.plan, planPath, planDurationMs, warnings },
 			});
 			return { plan: result.plan, planPath, rawJson: result.rawJson, plannerUsage: result.usage, planDurationMs };
 		})();

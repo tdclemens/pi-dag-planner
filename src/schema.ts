@@ -62,6 +62,13 @@ export const DAG_PLAN_SCHEMA: SchemaObject = {
 						items: { type: "string", pattern: NON_BLANK },
 						description: "Optional per-step tool allowlist for the subagent.",
 					},
+					touches: {
+						type: "array",
+						uniqueItems: true,
+						items: { type: "string", pattern: NON_BLANK },
+						description:
+							"Files (relative to the repo root) and named shared resources this step creates or modifies (e.g. \"package-lock.json\", \"ports:3000\"). Steps whose touches overlap are serialized by the executor; parallel steps must have disjoint touches.",
+					},
 				},
 			},
 		},

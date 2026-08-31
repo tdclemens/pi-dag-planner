@@ -14,6 +14,14 @@ export interface DagNode {
 	dependsOn: string[];
 	/** Optional per-node tool allowlist, passed to the subagent as --tools. */
 	tools?: string[];
+	/**
+	 * Files (relative to the repo root) and named shared resources this step
+	 * creates or modifies, e.g. "src/app.ts", "package-lock.json",
+	 * "ports:3000". The executor serializes steps whose touches overlap; the
+	 * planner keeps them disjoint for parallel steps (validatePlan warns
+	 * otherwise). Read-only steps omit it (or use []).
+	 */
+	touches?: string[];
 }
 
 /** The plan produced by the planner (and embedded in the saved markdown). */
@@ -22,8 +30,12 @@ export interface DagPlan {
 	steps: DagNode[];
 }
 
-/** Result of validating a plan (schema + graph rules). */
-export type PlanValidation = { ok: true } | { ok: false; error: string };
+/**
+ * Result of validating a plan (schema + graph rules). `ok: true` may carry
+ * non-fatal warnings (e.g. unordered `touches` overlap that the executor
+ * will serialize at run time).
+ */
+export type PlanValidation = { ok: true; warnings?: string[] } | { ok: false; error: string };
 
 export type NodeStatus = "pending" | "running" | "done" | "failed" | "skipped" | "aborted";
 
@@ -93,4 +105,10 @@ export interface PlannerResult {
 export type DagEvent =
 	| { type: "node-start"; nodeId: string }
 	| { type: "snippet"; nodeId: string; snippet: ToolSnippet }
+	/**
+	 * A ready node is held back because a running node holds one of its
+	 * declared `touches`. Emitted only when the blocking resource/holder
+	 * changes (not every scheduler tick).
+	 */
+	| { type: "node-blocked"; nodeId: string; resource: string; heldBy: string }
 	| { type: "node-end"; nodeId: string; result: NodeResult };

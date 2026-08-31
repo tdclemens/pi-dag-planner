@@ -84,6 +84,35 @@ test("update() requests a re-render for every event type", () => {
 
 	h.emit({ type: "node-end", nodeId: "b", result: result({ id: "b", status: "skipped", skipReason: "x" }) });
 	assert.equal(h.renders, 4, "node-end (skipped)");
+
+	h.emit({ type: "node-blocked", nodeId: "b", resource: "src/x.ts", heldBy: "a" });
+	assert.equal(h.renders, 5, "node-blocked");
+});
+
+test("pending row shows the file-lock wait while a running node holds the resource", () => {
+	const lockPlan: DagPlan = {
+		goal: "lock goal",
+		steps: [
+			{ id: "s1", title: "One", prompt: "p", dependsOn: [], touches: ["src/x.ts"] },
+			{ id: "s2", title: "Two", prompt: "p", dependsOn: [], touches: ["src/x.ts"] },
+		],
+	};
+	const dashboard = new RunDashboard(lockPlan, theme, () => {}, () => {});
+	dashboard.update({ type: "node-start", nodeId: "s1" });
+	dashboard.update({ type: "node-blocked", nodeId: "s2", resource: "src/x.ts", heldBy: "s1" });
+	let lines = dashboard.render(W);
+	let row = lines.find((l) => l.includes("Two"))!;
+	assert.ok(row.includes("file lock"), row);
+	assert.ok(row.includes("src/x.ts"), row);
+	assert.ok(row.includes("s1"), row);
+	assert.ok(!row.includes("(waiting: s1)"), "not a dependency wait");
+
+	lines = dashboard.render(W);
+	assert.ok(lines.find((l) => l.includes("One"))!.includes("▶"), "holder keeps its running row");
+	dashboard.update({ type: "node-start", nodeId: "s2" });
+	lines = dashboard.render(W);
+	row = lines.find((l) => l.includes("Two"))!;
+	assert.ok(!row.includes("file lock"), row);
 });
 
 test("render cache is invalidated by update() so repaints show fresh state", () => {
@@ -299,4 +328,20 @@ test("renderPlanMessage omits the plan duration when unknown (older sessions)", 
 	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
 	const text = comp.render(W).join("\n");
 	assert.ok(!text.includes("planned in"), text);
+});
+
+test("renderPlanMessage shows validation warnings when the plan has them", () => {
+	const warning = 'steps "a" and "b" both touch "src/app.ts" but are not ordered by a dependency; they will be serialized by the file lock';
+	const msg = {
+		content: "DAG Plan — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md", warnings: [warning] },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(text.includes("⚠"), text);
+	assert.ok(text.includes('both touch "src/app.ts"'), text);
+	// No warnings → no warning lines.
+	const msg2 = { content: "x", details: { plan, planPath: "/p" } };
+	const text2 = renderPlanMessage(msg2 as never, { expanded: false, outputPad: 0 }, theme).render(W).join("\n");
+	assert.ok(!text2.includes("⚠"), text2);
 });

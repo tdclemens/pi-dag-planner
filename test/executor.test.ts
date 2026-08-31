@@ -65,6 +65,7 @@ interface SpawnRecord {
 	args: string[];
 	cwd: string;
 	proc: FakeProc;
+	env?: Record<string, string>;
 }
 
 function makeHarness(opts?: {
@@ -75,9 +76,9 @@ function makeHarness(opts?: {
 	let active = 0;
 	let maxActive = 0;
 
-	const spawnImpl = (command: string, args: string[], cwd: string): ChildProcess => {
+	const spawnImpl = (command: string, args: string[], cwd: string, env?: Record<string, string>): ChildProcess => {
 		const proc = new FakeProc();
-		const record: SpawnRecord = { command, args, cwd, proc };
+		const record: SpawnRecord = { command, args, cwd, proc, env };
 		spawns.push(record);
 		active++;
 		maxActive = Math.max(maxActive, active);
@@ -506,4 +507,95 @@ test("runPiSubagent with a pre-aborted signal kills the child", async () => {
 	assert.equal(run.wasAborted, true);
 	assert.ok(h.spawns[0]!.proc.killed);
 	assert.ok(h.spawns[0]!.proc.signals.includes("SIGTERM"));
+});
+
+// --- declared `touches` resource mutex ---------------------------------------
+
+test("runPlan serializes nodes whose touches overlap (declared file lock)", async () => {
+	const plan: DagPlan = {
+		goal: "g",
+		steps: [
+			{ ...node("s1"), touches: ["src/app.ts"] },
+			{ ...node("s2"), touches: ["src/app.ts"] },
+			{ ...node("s3"), touches: ["src/other.ts"] },
+		],
+	};
+	const h = makeHarness();
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		maxParallel: 3,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.ok(results.every((r) => r.status === "done"), results.map((r) => r.status).join(","));
+	// With 3 free slots, s1+s3 (disjoint) overlap, but s2 must wait for s1:
+	// the observed peak concurrency is exactly 2, not 3.
+	assert.equal(h.maxActive, 2, `saw maxActive=${h.maxActive}, expected 2`);
+	const blocked = events.filter((e) => e.type === "node-blocked");
+	assert.equal(blocked.length, 1, `expected one node-blocked event, got ${JSON.stringify(blocked)}`);
+	assert.deepEqual(blocked[0], { type: "node-blocked", nodeId: "s2", resource: "src/app.ts", heldBy: "s1" });
+});
+
+test("runPlan keeps nodes with disjoint touches fully parallel", async () => {
+	const plan: DagPlan = {
+		goal: "g",
+		steps: [
+			{ ...node("s1"), touches: ["a.ts"] },
+			{ ...node("s2"), touches: ["b.ts"] },
+			{ ...node("s3"), touches: ["c.ts"] },
+		],
+	};
+	const h = makeHarness();
+	await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		maxParallel: 3,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(h.maxActive, 3, "disjoint touches must not serialize");
+});
+
+test("runPlan releases held resources so a blocked node starts after the holder finishes", async () => {
+	const plan: DagPlan = {
+		goal: "g",
+		steps: [
+			{ ...node("s1"), touches: ["shared.ts"] },
+			{ ...node("s2"), touches: ["shared.ts"] },
+		],
+	};
+	const h = makeHarness();
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		maxParallel: 2,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.ok(results.every((r) => r.status === "done"), results.map((r) => r.status).join(","));
+	const s2Starts = events.filter((e) => e.type === "node-start" && e.nodeId === "s2");
+	assert.equal(s2Starts.length, 1, "s2 starts exactly once, after s1's release");
+});
+
+// --- lock-guard injection ------------------------------------------------------
+
+test("runPlan injects the lock-guard extension and DAG_NODE_ID into every node subagent", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2")] };
+	const h = makeHarness();
+	await runPlan(plan, { cwd: process.cwd(), signal: new AbortController().signal, spawnImpl: h.spawnImpl });
+	assert.equal(h.spawns.length, 2);
+	for (const rec of h.spawns) {
+		// A pi-entry prefix may precede the flags (env-dependent), so locate --mode.
+		const start = rec.args.indexOf("--mode");
+		assert.notEqual(start, -1, `--mode missing in ${rec.args.join(" ")}`);
+		assert.deepEqual(rec.args.slice(start, start + 4), ["--mode", "json", "-p", "--no-session"], "core flags in order");
+		const e = rec.args.indexOf("-e");
+		assert.notEqual(e, -1, `expected -e in ${rec.args.join(" ")}`);
+		assert.ok(rec.args[e + 1]!.endsWith("lock-guard.ts"), rec.args[e + 1]);
+		assert.ok(rec.args[rec.args.length - 1]?.includes("Overall goal: g"), "prompt stays the last positional");
+		assert.ok(rec.env && /^s[12]$/.test(rec.env.DAG_NODE_ID ?? ""), `DAG_NODE_ID missing in ${JSON.stringify(rec.env)}`);
+	}
+	assert.notEqual(h.spawns[0]!.env?.DAG_NODE_ID, h.spawns[1]!.env?.DAG_NODE_ID);
 });

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { reportExcerpt, renderPlanSummary, RunDashboard } from "../src/ui.ts";
+import { reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
 import type { DagEvent, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
 
@@ -271,4 +271,32 @@ test("renderPlanSummary falls back to plain content without details", () => {
 		theme,
 	);
 	assert.ok(comp.render(W).join("\n").includes("DAG run completed — plain"));
+});
+
+// ---------------------------------------------------------------------------
+// renderPlanMessage
+// ---------------------------------------------------------------------------
+
+test("renderPlanMessage shows plan tree and the plan-phase duration when known", () => {
+	const msg = {
+		content: "DAG Plan — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md", planDurationMs: 42300 },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(text.includes("DAG Plan — 2 steps"), text);
+	assert.ok(text.includes("planned in 42.3s"), text);
+	assert.ok(text.includes("wave 1"), text);
+	assert.ok(text.includes("Plan saved:"), text);
+	assert.ok(!text.includes("Step prompts"), "collapsed must not show step prompts");
+});
+
+test("renderPlanMessage omits the plan duration when unknown (older sessions)", () => {
+	const msg = {
+		content: "DAG Plan — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md" },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(!text.includes("planned in"), text);
 });

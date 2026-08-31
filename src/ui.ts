@@ -197,6 +197,8 @@ export function formatSnippet(toolName: string, args: Record<string, unknown>, f
 export interface DagPlanDetails {
 	plan: DagPlan;
 	planPath: string;
+	/** Wall-clock time of the DAG Plan phase (incl. retries), if known. */
+	planDurationMs?: number;
 }
 
 export function renderPlanMessage(
@@ -226,7 +228,9 @@ export function renderPlanMessage(
 	} catch {
 		waves = [plan.steps];
 	}
-	lines.push(theme.fg("dim", `${waves.length} wave${waves.length > 1 ? "s" : ""}`));
+	const plannedIn =
+		details.planDurationMs !== undefined ? ` · planned in ${formatDuration(details.planDurationMs)}` : "";
+	lines.push(theme.fg("dim", `${waves.length} wave${waves.length > 1 ? "s" : ""}${plannedIn}`));
 
 	const maxIdLen = Math.max(0, ...plan.steps.map((s) => s.id.length));
 	waves.forEach((wave, i) => {
@@ -274,6 +278,8 @@ export interface DagPlanSummaryDetails {
 	failed: number;
 	skipped: number;
 	durationMs: number;
+	/** Wall-clock time of the DAG Plan phase (incl. retries), if known. */
+	planDurationMs?: number;
 	usage: UsageStats;
 	results: NodeResult[];
 }

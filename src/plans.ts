@@ -48,7 +48,7 @@ export function planFileName(goal: string, d: Date = new Date(), dir: string = P
 export type PlanFileStatus = "pending" | "executing" | "completed" | "completed-with-failures" | "aborted";
 
 /** Render the full plan markdown (header, steps list, embedded JSON). */
-export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: PlanFileStatus): string {
+export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: PlanFileStatus, planDurationMs?: number): string {
 	let waveDesc: string;
 	try {
 		waveDesc = topologicalLevels(plan.steps)
@@ -60,6 +60,7 @@ export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: Pla
 	const lines: string[] = [];
 	lines.push(`# DAG Plan: ${plan.goal}`, "");
 	lines.push(`- **Created:** ${new Date().toISOString()}`);
+	if (planDurationMs !== undefined) lines.push(`- **Planned in:** ${formatDuration(planDurationMs)}`);
 	lines.push(`- **Status:** ${status}`);
 	lines.push(`- **Prompt:** ${rawPrompt}`);
 	lines.push(`- **Steps:** ${plan.steps.length} (waves: ${waveDesc})`);
@@ -72,11 +73,11 @@ export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: Pla
 }
 
 /** Save a new plan file; returns its path. */
-export async function savePlan(plan: DagPlan, rawPrompt: string): Promise<string> {
+export async function savePlan(plan: DagPlan, rawPrompt: string, planDurationMs?: number): Promise<string> {
 	return enqueue(async () => {
 		await fs.promises.mkdir(PLANS_DIR, { recursive: true });
 		const file = path.join(PLANS_DIR, planFileName(plan.goal));
-		await fs.promises.writeFile(file, renderPlanMarkdown(plan, rawPrompt, "pending"), "utf8");
+		await fs.promises.writeFile(file, renderPlanMarkdown(plan, rawPrompt, "pending", planDurationMs), "utf8");
 		return file;
 	});
 }

@@ -94,6 +94,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		let planResult: PlannerResult | undefined;
 		let planFeedback: string | undefined;
 		let planPriorJson: string | undefined;
+		const planStartedAt = Date.now();
 
 		for (let attempt = 1; ; attempt++) {
 			if (signal.aborted) return;
@@ -109,8 +110,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			}
 			planFeedback = outcome.error;
 		}
+		const planDurationMs = Date.now() - planStartedAt;
 
-		const current = await presentPlan(ctx, planResult!, prompt);
+		const current = await presentPlan(ctx, planResult!, prompt, planDurationMs);
 		if (!current) return;
 
 		// ------------------------------------------------------------------
@@ -136,13 +138,14 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			if (fb === undefined || signal.aborted) return;
 			refineAttempts++;
 
+			const rePlanStartedAt = Date.now();
 			const reOutcome = await planOnce(ctx, prompt, modelLabel, fb.trim() || undefined, gate.rawJson);
 			if (reOutcome === null) return;
 			if (!reOutcome.ok) {
 				ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
 				return;
 			}
-			const revised = await presentPlan(ctx, reOutcome.result, prompt);
+			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
 			if (!revised) return;
 			gate = revised;
 		}
@@ -238,7 +241,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			}
 		}
 		lines.push("");
-		lines.push(`Totals: ${formatDuration(durationMs)} · ${formatUsageStats(totalUsage)} · plan: ${shortenHome(planPath)}`);
+		lines.push(
+			`Totals: ${formatDuration(durationMs)} · ${formatUsageStats(totalUsage)} · plan: ${shortenHome(planPath)} (planned in ${formatDuration(gate.planDurationMs)})`,
+		);
 
 		pi.sendMessage({
 			customType: SUMMARY_MESSAGE_TYPE,
@@ -251,6 +256,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				failed,
 				skipped,
 				durationMs,
+				planDurationMs: gate.planDurationMs,
 				usage: totalUsage,
 				// Full per-node reports for the renderer's expanded view (Ctrl+O).
 				// details never reach the LLM; snippets stay in the per-node
@@ -307,16 +313,18 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		ctx: ExtensionCommandContext,
 		result: PlannerResult,
 		prompt: string,
+		planDurationMs: number,
 	): Promise<{
 		plan: PlannerResult["plan"];
 		planPath: string;
 		rawJson: string;
 		plannerUsage: PlannerResult["usage"];
+		planDurationMs: number;
 	} | null> {
 		return (async () => {
 			let planPath: string;
 			try {
-				planPath = await plans.savePlan(result.plan, prompt);
+				planPath = await plans.savePlan(result.plan, prompt, planDurationMs);
 			} catch (e) {
 				ctx.ui.notify(`Failed to save plan file: ${e instanceof Error ? e.message : String(e)}`, "error");
 				return null;
@@ -326,9 +334,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				customType: PLAN_MESSAGE_TYPE,
 				content: `DAG Plan — ${result.plan.goal} (${result.plan.steps.length} steps)`,
 				display: true,
-				details: { plan: result.plan, planPath },
+				details: { plan: result.plan, planPath, planDurationMs },
 			});
-			return { plan: result.plan, planPath, rawJson: result.rawJson, plannerUsage: result.usage };
+			return { plan: result.plan, planPath, rawJson: result.rawJson, plannerUsage: result.usage, planDurationMs };
 		})();
 	}
 }

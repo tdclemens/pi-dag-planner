@@ -9,7 +9,7 @@
 import type { ChildProcess } from "node:child_process";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { validatePlan } from "./dag.ts";
+import { getMaxSteps, validatePlan } from "./dag.ts";
 import { runPiSubagent } from "./executor.ts";
 import { formatSnippetPlain } from "./ui.ts";
 import type { DagNode, DagPlan, PlannerResult, UsageStats } from "./types.ts";
@@ -20,9 +20,12 @@ import { emptyUsage } from "./types.ts";
  * explore the repository before emitting the plan JSON. The JSON shape below
  * is the output contract consumed by extractPlanJson/validatePlan (the
  * canonical schema lives in src/schema.ts; the plan is validated
- * automatically before it can be saved or executed).
+ * automatically before it can be saved or executed). `maxSteps` is the soft
+ * step-count cap (DAG_PLAN_MAX_STEPS) interpolated into the size guidance;
+ * the hard ceiling is enforced by validatePlan, not by this prompt.
  */
-export const PLANNER_SYSTEM_PROMPT = `You are a DAG planner with read-only repository tools. Your output is a plan that isolated coding subagents will execute in parallel. The plan must be executable to completion and produce a working, verified result for the user's request.
+export function plannerSystemPrompt(maxSteps: number): string {
+	return `You are a DAG planner with read-only repository tools. Your output is a plan that isolated coding subagents will execute in parallel. The plan must be executable to completion and produce a working, verified result for the user's request.
 
 First, explore the repository (budget: ~10-15 tool calls, no more):
 - Read the manifest / build config (package.json, pyproject.toml, Cargo.toml, go.mod, …) to learn the toolchain, scripts, and the exact commands that run tests, builds, and typechecks.
@@ -45,7 +48,7 @@ Then respond with ONLY a JSON object — no prose, no markdown fences — matchi
 }
 
 Rules:
-- 3-8 steps. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
+- Size the plan to the task: 2-4 steps for small, focused tasks; up to ${maxSteps} for large multi-module tasks. Prefer fewer, larger steps over many thin ones — each step is one self-contained subagent session. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
 - Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Exception: steps that modify the same file or resource MUST be ordered with an edge — parallel steps must touch disjoint files.
 - "touches" is required for every step that creates or modifies anything: list the exact file paths (relative to the repo root) the step will write, plus the shared resources its commands mutate. npm/pnpm install → include "package-lock.json" and "node_modules"; a formatter → the files it rewrites; a dev server or test database → a named resource like "ports:3000" or "test-db". Read-only steps use []. Steps whose touches overlap are hard-serialized by the executor; when two steps must touch the same file, add a dependsOn edge so the order is explicit in the plan (and still list the overlap in touches).
@@ -56,9 +59,11 @@ Rules:
 - Keep each step to one focused subagent session: split large work into per-module steps rather than one giant step, and keep each prompt under ~150 words.
 - No git mutations (commits, pushes, branches) or destructive operations unless the user's request explicitly requires them; if a commit is required, make it a single final step after all edits.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.`;
+}
 
 /** Fallback prompt for the blind single-call planner (no tools). */
-export const BLIND_PLANNER_SYSTEM_PROMPT = `You are a DAG planner. Decompose the user's request into 3-8 independent, verifiable steps that can be executed by isolated coding subagents.
+export function blindPlannerPrompt(maxSteps: number): string {
+	return `You are a DAG planner. Decompose the user's request into independent, verifiable steps that can be executed by isolated coding subagents: 2-4 for small, focused tasks, up to ${maxSteps} for large multi-module tasks.
 
 Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Each "prompt" must be self-contained — subagents share NO conversation context: state the goal, the concrete task, relevant file paths and commands, expected artifacts, and how to report results.
 
@@ -78,11 +83,12 @@ Respond with ONLY a JSON object — no prose, no markdown fences — matching ex
 }
 
 Rules:
-- 3-8 steps. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
+- Size the plan to the task: 2-4 steps for small, focused tasks; up to ${maxSteps} for large multi-module tasks. Prefer fewer, larger steps over many thin ones — each step is one self-contained subagent session. ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
 - "touches" (required for steps that modify anything): the exact file paths the step creates or modifies, plus shared resources its commands mutate (lockfiles, build dirs, ports); read-only steps use []. Overlapping touches are serialized at run time — keep them disjoint or order the steps with dependsOn.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
 - The last step(s) should verify the work (run tests, build, or report findings).`;
+}
 
 /** Read-only tools the exploring planner is allowed to use. */
 export const PLANNER_EXPLORE_TOOLS = ["read", "grep", "find", "ls"];
@@ -98,14 +104,15 @@ export function plannerExplores(): boolean {
 
 /**
  * pi CLI flags for the exploring planner subagent: read-only tools, no
- * extensions/skills/context files, its own system prompt. Pure — testable.
+ * extensions/skills/context files, its own system prompt. `maxSteps` (soft
+ * cap) defaults to DAG_PLAN_MAX_STEPS and is interpolated into the prompt.
  */
-export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string): string[] {
+export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, maxSteps: number = getMaxSteps()): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	args.push("--no-extensions", "--no-skills", "--no-context-files");
 	args.push("--tools", PLANNER_EXPLORE_TOOLS.join(","));
-	args.push("--system-prompt", PLANNER_SYSTEM_PROMPT);
+	args.push("--system-prompt", plannerSystemPrompt(maxSteps));
 	return args;
 }
 
@@ -231,7 +238,7 @@ export async function plan(
 
 	const response = await ctx.modelRegistry.complete(
 		model,
-		{ systemPrompt: BLIND_PLANNER_SYSTEM_PROMPT, messages: [userMessage] },
+		{ systemPrompt: blindPlannerPrompt(getMaxSteps()), messages: [userMessage] },
 		{ signal },
 	);
 

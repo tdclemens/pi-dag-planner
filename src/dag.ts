@@ -9,24 +9,59 @@ import type { DagNode, DagPlan, PlanValidation } from "./types.ts";
 
 export type { PlanValidation };
 
+/** Recommended (soft) step count: planner guidance + plan-card warning. */
+export const DEFAULT_MAX_STEPS = 12;
+
+/**
+ * Hard step-count ceiling enforced by validatePlan: a runaway plan that
+ * slipped past the prompt guidance is rejected (the planner re-plans with
+ * the error as feedback) instead of executing dozens of agent sessions.
+ */
+export const HARD_MAX_STEPS = 32;
+
+/** Soft step count from DAG_PLAN_MAX_STEPS (defaults to DEFAULT_MAX_STEPS). */
+export function getMaxSteps(): number {
+	const raw = process.env.DAG_PLAN_MAX_STEPS;
+	if (raw) {
+		const n = Number.parseInt(raw, 10);
+		if (Number.isFinite(n) && n >= 1) return n;
+	}
+	return DEFAULT_MAX_STEPS;
+}
+
+/** Hard ceiling: the configured soft cap may raise it, but never lower it. */
+export function getHardMaxSteps(): number {
+	return Math.max(HARD_MAX_STEPS, getMaxSteps());
+}
+
 /**
  * Validate a plan: first the canonical JSON schema (src/schema.ts — types,
  * required fields, id pattern, no unknown properties), then the graph rules
  * the schema cannot express: unique ids, known deps, no self-deps, acyclic.
  * `plan` may be unknown (from untrusted LLM output) — this returns a
  * structured error instead of throwing. Rejects plans with cycles, so no
- * cyclic plan can ever reach the scheduler.
+ * cyclic plan can ever reach the scheduler. Also rejects plans above the
+ * hard step ceiling (getHardMaxSteps) — the prompt guidance is soft, the
+ * ceiling is not.
  *
  * Non-fatal: unordered `touches` overlap (two steps may modify the same
  * file without a dependency between them) does NOT reject the plan — the
  * executor serializes those steps at run time — but it is reported as a
  * warning so the user sees the implied loss of parallelism before
- * approving.
+ * approving. Likewise, exceeding the soft step cap (getMaxSteps) is a
+ * warning, not a rejection.
  */
 export function validatePlan(plan: unknown): PlanValidation {
 	const schema = validatePlanSchema(plan);
 	if (!schema.ok) return schema;
 	const steps = (plan as DagPlan).steps;
+
+	const hardMax = getHardMaxSteps();
+	if (steps.length > hardMax)
+		return {
+			ok: false,
+			error: `plan has ${steps.length} steps; hard limit is ${hardMax} (raise DAG_PLAN_MAX_STEPS to allow larger plans)`,
+		};
 
 	const seen = new Set<string>();
 	for (const step of steps) {
@@ -42,7 +77,13 @@ export function validatePlan(plan: unknown): PlanValidation {
 	}
 	const cycle = findCycle(steps);
 	if (cycle) return { ok: false, error: `cycle detected: ${cycle.join(" → ")}` };
-	const warnings = touchesOverlapWarnings(steps);
+	const warnings: string[] = [];
+	const softMax = getMaxSteps();
+	if (steps.length > softMax)
+		warnings.push(
+			`plan has ${steps.length} steps (recommended max ${softMax}; env DAG_PLAN_MAX_STEPS) — each step is a separate agent session, review before executing`,
+		);
+	warnings.push(...touchesOverlapWarnings(steps));
 	return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
 }
 

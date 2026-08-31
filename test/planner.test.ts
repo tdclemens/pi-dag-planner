@@ -3,14 +3,15 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
 import {
-	BLIND_PLANNER_SYSTEM_PROMPT,
 	buildPlannerArgs,
+	blindPlannerPrompt,
 	extractPlanJson,
 	normalizePlan,
 	plannerExplores,
 	plan,
-	PLANNER_SYSTEM_PROMPT,
+	plannerSystemPrompt,
 } from "../src/planner.ts";
+import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
 
 test("extractPlanJson parses raw JSON", () => {
 	const raw = JSON.stringify({
@@ -171,14 +172,36 @@ function assistantMessage(text: string, extra: Record<string, unknown> = {}) {
 }
 
 test("buildPlannerArgs pins a read-only, extension-free planner subagent", () => {
-	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium"), [
+	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium", 12), [
 		"--mode", "json", "-p", "--no-session",
 		"--model", "anthropic/claude-x",
 		"--thinking", "medium",
 		"--no-extensions", "--no-skills", "--no-context-files",
 		"--tools", "read,grep,find,ls",
-		"--system-prompt", PLANNER_SYSTEM_PROMPT,
+		"--system-prompt", plannerSystemPrompt(12),
 	]);
+});
+
+test("buildPlannerArgs defaults maxSteps from DAG_PLAN_MAX_STEPS", () => {
+	const saved = process.env.DAG_PLAN_MAX_STEPS;
+	try {
+		delete process.env.DAG_PLAN_MAX_STEPS;
+		const def = buildPlannerArgs("p/m");
+		assert.equal(def[def.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
+		process.env.DAG_PLAN_MAX_STEPS = "20";
+		const custom = buildPlannerArgs("p/m");
+		assert.equal(custom[custom.indexOf("--system-prompt") + 1], plannerSystemPrompt(20));
+	} finally {
+		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
+		else process.env.DAG_PLAN_MAX_STEPS = saved;
+	}
+});
+
+test("planner prompts interpolate the soft step cap", () => {
+	assert.match(plannerSystemPrompt(12), /up to 12 for large multi-module tasks/);
+	assert.match(plannerSystemPrompt(20), /up to 20 for large multi-module tasks/);
+	assert.doesNotMatch(plannerSystemPrompt(20), /up to 12/);
+	assert.match(blindPlannerPrompt(15), /up to 15 for large multi-module tasks/);
 });
 
 test("buildPlannerArgs omits --thinking when undefined", () => {
@@ -186,15 +209,16 @@ test("buildPlannerArgs omits --thinking when undefined", () => {
 });
 
 test("agentic prompt requires exploration + verification; both prompts contract on touches", () => {
-	assert.match(PLANNER_SYSTEM_PROMPT, /explore the repository/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /read-only/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /verification is required/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
-	assert.match(PLANNER_SYSTEM_PROMPT, /"touches"/);
-	assert.match(PLANNER_SYSTEM_PROMPT, /package-lock\.json/, "shared resources (lockfiles) must be declared");
-	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /ONLY a JSON object/i);
-	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /"touches"/);
-	assert.match(BLIND_PLANNER_SYSTEM_PROMPT, /serialized at run time/);
+	const prompt = plannerSystemPrompt(12);
+	assert.match(prompt, /explore the repository/i);
+	assert.match(prompt, /read-only/i);
+	assert.match(prompt, /verification is required/i);
+	assert.match(prompt, /ONLY a JSON object/i);
+	assert.match(prompt, /"touches"/);
+	assert.match(prompt, /package-lock\.json/, "shared resources (lockfiles) must be declared");
+	assert.match(blindPlannerPrompt(12), /ONLY a JSON object/i);
+	assert.match(blindPlannerPrompt(12), /"touches"/);
+	assert.match(blindPlannerPrompt(12), /serialized at run time/);
 });
 
 test("plannerExplores env parsing (on by default)", () => {
@@ -216,14 +240,16 @@ test("plannerExplores env parsing (on by default)", () => {
 
 test("plan() explores via subprocess and extracts the plan", async () => {
 	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	const savedSteps = process.env.DAG_PLAN_MAX_STEPS;
 	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
+	delete process.env.DAG_PLAN_MAX_STEPS;
 	try {
 		const snippets: string[] = [];
 		const result = await plan(fakeCtx(), "Add tests", {
 			onExplore: (s) => snippets.push(s),
 			spawnImpl: (_command, args, cwd) => {
 				assert.equal(cwd, "/tmp/repo");
-				assert.equal(args[args.indexOf("--system-prompt") + 1], PLANNER_SYSTEM_PROMPT);
+				assert.equal(args[args.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
 				assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
 				return fakeProc([
 					{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
@@ -239,6 +265,8 @@ test("plan() explores via subprocess and extracts the plan", async () => {
 	} finally {
 		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
 		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+		if (savedSteps === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
+		else process.env.DAG_PLAN_MAX_STEPS = savedSteps;
 	}
 });
 
@@ -320,7 +348,9 @@ test("plan() automatically rejects a plan that fails the JSON schema", async () 
 
 test("plan() uses the blind single completion when exploration is disabled", async () => {
 	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
+	const savedSteps = process.env.DAG_PLAN_MAX_STEPS;
 	process.env.DAG_PLAN_PLANNER_EXPLORE = "0";
+	delete process.env.DAG_PLAN_MAX_STEPS;
 	try {
 		let capturedSystemPrompt: string | undefined;
 		const ctx: any = {
@@ -338,9 +368,11 @@ test("plan() uses the blind single completion when exploration is disabled", asy
 		};
 		const result = await plan(ctx, "x");
 		assert.ok(result);
-		assert.equal(capturedSystemPrompt, BLIND_PLANNER_SYSTEM_PROMPT);
+		assert.equal(capturedSystemPrompt, blindPlannerPrompt(DEFAULT_MAX_STEPS));
 	} finally {
 		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
 		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
+		if (savedSteps === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
+		else process.env.DAG_PLAN_MAX_STEPS = savedSteps;
 	}
 });

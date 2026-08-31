@@ -140,6 +140,8 @@ Totals: 4/4 succeeded · $0.0712 · 2m03s
 | Setting | Mechanism | Default |
 |---------|-----------|---------|
 | Max parallel nodes | env `DAG_PLAN_MAX_PARALLEL` | `4` |
+| Max steps per plan (soft cap: planner size guidance + ⚠ on the plan card) | env `DAG_PLAN_MAX_STEPS` | `12` |
+| Hard step ceiling (plans above it are rejected and re-planned) | derived | `32` (raised to `DAG_PLAN_MAX_STEPS` when set higher) |
 | Planner repo exploration (read-only subagent) | env `DAG_PLAN_PLANNER_EXPLORE` | on (`0`/`false`/`off` = single blind call) |
 | Planning retries on invalid JSON | — | 1 retry |
 | Refine attempts | — | 3 |

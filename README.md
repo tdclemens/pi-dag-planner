@@ -26,13 +26,13 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `DAG_PLAN_PLANNER_EXPLORE=0` for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card.
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `plannerExplore: false` in the config (see [Configuration](#configuration)) for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card.
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
    - **Reject** — the plan file is kept for reference
 3. **Save** — before execution, the plan is written to `~/.agents/plans/<timestamp>-<slug>.md` with the human-readable step list and the exact JSON embedded.
-4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, bounded by `DAG_PLAN_MAX_PARALLEL`) runs every node whose dependencies are complete, so independent branches execute concurrently. **Declared `touches` are mutex-protected at the scheduler**: a node holds its declared files/resources for the whole run, and a ready node whose touches collide with a running one stays pending (shown in the runner panel) until the holder finishes — no two nodes ever write the same declared file at the same time. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes, with the per-node file-lock extension (`src/lock-guard.ts`) injected via `-e` + `DAG_NODE_ID` to catch *undeclared* overlap at write time (see below).
+4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, set via `maxParallel` in the config) runs every node whose dependencies are complete, so independent branches execute concurrently. **Declared `touches` are mutex-protected at the scheduler**: a node holds its declared files/resources for the whole run, and a ready node whose touches collide with a running one stays pending (shown in the runner panel) until the holder finishes — no two nodes ever write the same declared file at the same time. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes, with the per-node file-lock extension (`src/lock-guard.ts`) injected via `-e` + `DAG_NODE_ID` to catch *undeclared* overlap at write time (see below).
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
@@ -137,16 +137,75 @@ Totals: 4/4 succeeded · $0.0712 · 2m03s
 
 ## Configuration
 
-| Setting | Mechanism | Default |
-|---------|-----------|---------|
-| Max parallel nodes | env `DAG_PLAN_MAX_PARALLEL` | `4` |
-| Max steps per plan (soft cap: planner size guidance + ⚠ on the plan card) | env `DAG_PLAN_MAX_STEPS` | `12` |
-| Hard step ceiling (plans above it are rejected and re-planned) | derived | `32` (raised to `DAG_PLAN_MAX_STEPS` when set higher) |
-| Planner repo exploration (read-only subagent) | env `DAG_PLAN_PLANNER_EXPLORE` | on (`0`/`false`/`off` = single blind call) |
-| Planning retries on invalid JSON | — | 1 retry |
-| Refine attempts | — | 3 |
-| Plan directory | — | `~/.agents/plans/` (fixed) |
-| Dependency output injected into a node prompt | — | 8 KB per dep / 16 KB total |
+All options live in a JSON config file in the usual pi extension locations —
+no environment variables. Project values override global values per key,
+and every option is optional with a default, so you can omit the file (or
+any key) entirely and behavior is unchanged.
+
+| Location | Scope |
+|----------|-------|
+| `~/.pi/agent/dag-plan.json` | Global (all projects) |
+| `.pi/dag-plan.json` | Project-local (trusted projects only; overrides global per key) |
+
+Example with all options and their defaults:
+
+```json
+{
+  "maxSteps": 12,
+  "maxParallel": 4,
+  "plannerExplore": true,
+  "plannerExtensions": [],
+  "runnerExtensions": []
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `maxSteps` | integer ≥ 1 | `12` | Soft step-count cap: the planner sizes plans to it, and plans above it get a ⚠ on the plan card. |
+| `maxParallel` | integer ≥ 1 | `4` | Max concurrent runner subagents. |
+| `plannerExplore` | boolean | `true` | Planner explores the repo as a read-only subagent before planning. `false` = the faster single blind LLM call (no tools). |
+| `plannerExtensions` | string[] | `[]` | Extra extensions loaded into the planner subagent (see below). |
+| `runnerExtensions` | string[] | `[]` | Extra extensions loaded into every runner node subagent (see below). |
+
+Fixed limits (not configurable): hard step ceiling `32` (raised to
+`maxSteps` when that is higher — plans above the ceiling are rejected and
+re-planned), 1 planning retry on invalid JSON, 3 refine attempts, plan
+directory `~/.agents/plans/`, 8 KB per dep / 16 KB total injected into node
+prompts.
+
+### Extra extensions for planner / runner
+
+By default the planner subagent is locked down (read-only tools, no
+auto-discovered extensions/skills/context files) and each runner node is a
+plain subagent with the standard tools plus the built-in file lock. To give
+them **extra tools**, list extension paths in the matching key:
+
+```json
+{
+  "plannerExtensions": ["~/pi-extensions/brave-search.ts"],
+  "runnerExtensions": ["~/pi-extensions/web-tools/index.ts"]
+}
+```
+
+- Paths may be absolute, start with `~/`, or be relative to the directory of
+  the config file that provides them (same convention as pi's `settings.json`
+  resource paths).
+- **Planner:** extensions load into the locked-down planner on top of
+  `--no-extensions` (your normal extensions/skills still do not load). When
+  `plannerExtensions` is non-empty the read-only `--tools` allow-list is
+  dropped so the extensions' tools are actually available — the planner then
+  also gets pi's default tools (including `bash`/`write`). The planner prompt
+  still instructs it to never modify anything; this option is for tools that
+  help it *plan*, e.g. web search or MCP servers.
+- **Runner:** extensions load into every node subagent alongside the
+  built-in file lock. A node step that pins its own `tools` allow-list in the
+  plan is unaffected — that allow-list still applies.
+- Project arrays **replace** global arrays (they do not merge); put the full
+  list in the project file to override.
+
+Invalid values (bad JSON, wrong types, unknown keys) never break a run —
+the affected option falls back to its default and you get a ⚠ notification
+naming the file and field.
 
 ## Requirements
 
@@ -159,6 +218,7 @@ Totals: 4/4 succeeded · $0.0712 · 2m03s
 ```
 src/
 ├── index.ts     # /dag-plan command, message/entry renderers, flow orchestration
+├── config.ts    # dag-plan.json config loading (global + project merge, validation)
 ├── planner.ts   # planner prompt, LLM call, robust JSON extraction + validation
 ├── schema.ts    # canonical JSON Schema for the plan (2020-12) + ajv validation
 ├── dag.ts       # pure DAG utils: schema + graph validation (cycles, deps), topo levels

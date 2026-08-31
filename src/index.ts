@@ -17,6 +17,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { runPlan } from "./executor.ts";
+import { loadConfig, type DagPlanConfig } from "./config.ts";
 import { plan, plannerExplores, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
 import * as plans from "./plans.ts";
 import { validatePlan } from "./dag.ts";
@@ -81,6 +82,12 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		// the run via activeRun in that case).
 		const signal = ctx.signal ?? new AbortController().signal;
 
+		// Config: ~/.pi/agent/dag-plan.json plus .pi/dag-plan.json for trusted
+		// projects (project wins per key). Every option has a default, so a
+		// missing file is a no-op; bad values warn and fall back per field.
+		const { config, warnings: configWarnings } = loadConfig(ctx.isProjectTrusted() ? ctx.cwd : undefined);
+		for (const w of configWarnings) ctx.ui.notify(`dag-plan config: ${w}`, "warning");
+
 		let prompt = args.trim();
 		if (!prompt) {
 			const edited = await ctx.ui.editor("DAG plan — describe the task", "");
@@ -99,7 +106,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 
 		for (let attempt = 1; ; attempt++) {
 			if (signal.aborted) return;
-			const outcome = await planOnce(ctx, prompt, modelLabel, planFeedback, planPriorJson);
+			const outcome = await planOnce(ctx, prompt, modelLabel, config, planFeedback, planPriorJson);
 			if (outcome === null) return; // Esc during planning
 			if (outcome.ok) {
 				planResult = outcome.result;
@@ -140,7 +147,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			refineAttempts++;
 
 			const rePlanStartedAt = Date.now();
-			const reOutcome = await planOnce(ctx, prompt, modelLabel, fb.trim() || undefined, gate.rawJson);
+			const reOutcome = await planOnce(ctx, prompt, modelLabel, config, fb.trim() || undefined, gate.rawJson);
 			if (reOutcome === null) return;
 			if (!reOutcome.ok) {
 				ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
@@ -170,6 +177,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				cwd: ctx.cwd,
 				model: modelLabel,
 				thinkingLevel: ctx.thinkingLevel,
+				config,
 				originalPrompt: prompt,
 				signal: controller.signal,
 				onEvent: (e: DagEvent) => {
@@ -275,11 +283,12 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		ctx: ExtensionCommandContext,
 		prompt: string,
 		modelLabel: string,
+		config: DagPlanConfig,
 		feedback: string | undefined,
 		priorJson: string | undefined,
 	): Promise<PlanPhaseOutcome | null> {
 		return ctx.ui.custom<PlanPhaseOutcome | null>((tui, theme, _kb, done) => {
-			const label = plannerExplores()
+			const label = plannerExplores(config)
 				? `Planning with ${modelLabel} (exploring repo)…`
 				: `Planning with ${modelLabel}…`;
 			const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
@@ -303,6 +312,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				ctx,
 				prompt,
 				{
+					config,
 					feedback,
 					priorPlanJson: priorJson,
 					onExplore: (snippet) => {

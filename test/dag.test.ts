@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { dependentsIndex, findCycle, getHardMaxSteps, getMaxSteps, topologicalLevels, validatePlan, DEFAULT_MAX_STEPS, HARD_MAX_STEPS } from "../src/dag.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import { DAG_PLAN_SCHEMA, validatePlanSchema } from "../src/schema.ts";
 import type { DagNode } from "../src/types.ts";
 
@@ -162,82 +163,48 @@ test("validatePlan rejects duplicate ids", () => {
 // Step-count caps: soft cap (planner guidance + warning) and hard ceiling
 // ---------------------------------------------------------------------------
 
-test("getMaxSteps reads DAG_PLAN_MAX_STEPS (default 12)", () => {
-	const saved = process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		delete process.env.DAG_PLAN_MAX_STEPS;
-		assert.equal(getMaxSteps(), DEFAULT_MAX_STEPS);
-		assert.equal(getMaxSteps(), 12);
-		process.env.DAG_PLAN_MAX_STEPS = "20";
-		assert.equal(getMaxSteps(), 20);
-		for (const bad of ["0", "-3", "abc", ""] ) {
-			process.env.DAG_PLAN_MAX_STEPS = bad;
-			assert.equal(getMaxSteps(), DEFAULT_MAX_STEPS);
-		}
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = saved;
+test("getMaxSteps reads the config soft cap (default 12)", () => {
+	assert.equal(getMaxSteps(), DEFAULT_MAX_STEPS);
+	assert.equal(getMaxSteps(), 12);
+	assert.equal(getMaxSteps({ ...DEFAULT_CONFIG, maxSteps: 20 }), 20);
+	for (const bad of [0, -3, 1.5]) {
+		assert.equal(getMaxSteps({ ...DEFAULT_CONFIG, maxSteps: bad }), DEFAULT_MAX_STEPS);
 	}
 });
 
 test("getHardMaxSteps is max(HARD_MAX_STEPS, configured soft cap)", () => {
-	const saved = process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		delete process.env.DAG_PLAN_MAX_STEPS;
-		assert.equal(getHardMaxSteps(), HARD_MAX_STEPS);
-		process.env.DAG_PLAN_MAX_STEPS = "20";
-		assert.equal(getHardMaxSteps(), HARD_MAX_STEPS);
-		process.env.DAG_PLAN_MAX_STEPS = "40";
-		assert.equal(getHardMaxSteps(), 40);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = saved;
-	}
+	assert.equal(getHardMaxSteps(), HARD_MAX_STEPS);
+	assert.equal(getHardMaxSteps({ ...DEFAULT_CONFIG, maxSteps: 20 }), HARD_MAX_STEPS);
+	assert.equal(getHardMaxSteps({ ...DEFAULT_CONFIG, maxSteps: 40 }), 40);
 });
 
 test("validatePlan rejects plans above the hard step ceiling", () => {
-	const saved = process.env.DAG_PLAN_MAX_STEPS;
-	delete process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		const v = validatePlan({ goal: "g", steps: chain(HARD_MAX_STEPS + 1) });
-		assert.equal(v.ok, false);
-		assert.match((v as { error: string }).error, /hard limit is 32/);
-		assert.match((v as { error: string }).error, /DAG_PLAN_MAX_STEPS/);
-		// exactly at the ceiling: accepted
-		const at = validatePlan({ goal: "g", steps: chain(HARD_MAX_STEPS) });
-		assert.equal(at.ok, true);
-		// raising the soft cap raises the ceiling with it
-		process.env.DAG_PLAN_MAX_STEPS = "40";
-		assert.equal(validatePlan({ goal: "g", steps: chain(40) }).ok, true);
-		const tooBig = validatePlan({ goal: "g", steps: chain(41) });
-		assert.equal(tooBig.ok, false);
-		assert.match((tooBig as { error: string }).error, /hard limit is 40/);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = saved;
-	}
+	const v = validatePlan({ goal: "g", steps: chain(HARD_MAX_STEPS + 1) });
+	assert.equal(v.ok, false);
+	assert.match((v as { error: string }).error, /hard limit is 32/);
+	assert.match((v as { error: string }).error, /maxSteps/);
+	// exactly at the ceiling: accepted
+	const at = validatePlan({ goal: "g", steps: chain(HARD_MAX_STEPS) });
+	assert.equal(at.ok, true);
+	// raising the soft cap raises the ceiling with it
+	assert.equal(validatePlan({ goal: "g", steps: chain(40) }, { ...DEFAULT_CONFIG, maxSteps: 40 }).ok, true);
+	const tooBig = validatePlan({ goal: "g", steps: chain(41) }, { ...DEFAULT_CONFIG, maxSteps: 40 });
+	assert.equal(tooBig.ok, false);
+	assert.match((tooBig as { error: string }).error, /hard limit is 40/);
 });
 
 test("validatePlan warns (but stays ok) above the soft step cap", () => {
-	const saved = process.env.DAG_PLAN_MAX_STEPS;
-	delete process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		const v = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS + 1) });
-		assert.equal(v.ok, true);
-		assert.ok(
-			v.ok && v.warnings?.some((w) => /13 steps/.test(w) && /DAG_PLAN_MAX_STEPS/.test(w) && /agent session/.test(w)),
-		);
-		// exactly at the soft cap: no warning
-		const exact = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS) });
-		assert.ok(exact.ok && (exact.warnings ?? []).length === 0);
-		// a low soft cap warns for medium plans
-		process.env.DAG_PLAN_MAX_STEPS = "2";
-		const low = validatePlan({ goal: "g", steps: chain(3) });
-		assert.ok(low.ok && low.warnings?.some((w) => /3 steps \(recommended max 2/.test(w)));
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = saved;
-	}
+	const v = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS + 1) });
+	assert.equal(v.ok, true);
+	assert.ok(
+		v.ok && v.warnings?.some((w) => /13 steps/.test(w) && /maxSteps/.test(w) && /agent session/.test(w)),
+	);
+	// exactly at the soft cap: no warning
+	const exact = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS) });
+	assert.ok(exact.ok && (exact.warnings ?? []).length === 0);
+	// a low soft cap warns for medium plans
+	const low = validatePlan({ goal: "g", steps: chain(3) }, { ...DEFAULT_CONFIG, maxSteps: 2 });
+	assert.ok(low.ok && low.warnings?.some((w) => /3 steps \(recommended max 2/.test(w)));
 });
 
 test("validatePlan rejects self-dependency", () => {

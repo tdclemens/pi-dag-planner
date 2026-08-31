@@ -1,7 +1,7 @@
 /**
  * Planner: explores the repo as a read-only pi subagent (default) or makes a
- * single blind LLM call (DAG_PLAN_PLANNER_EXPLORE=0), then robust JSON
- * extraction and automatic validation of the plan against the canonical
+ * single blind LLM call (plannerExplore: false in the config), then robust
+ * JSON extraction and automatic validation of the plan against the canonical
  * JSON schema (src/schema.ts) plus the acyclicity rule. `extractPlanJson`
  * is pure and unit-testable.
  */
@@ -9,6 +9,7 @@
 import type { ChildProcess } from "node:child_process";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_CONFIG, type DagPlanConfig } from "./config.ts";
 import { getMaxSteps, validatePlan } from "./dag.ts";
 import { runPiSubagent } from "./executor.ts";
 import { formatSnippetPlain } from "./ui.ts";
@@ -21,7 +22,7 @@ import { emptyUsage } from "./types.ts";
  * is the output contract consumed by extractPlanJson/validatePlan (the
  * canonical schema lives in src/schema.ts; the plan is validated
  * automatically before it can be saved or executed). `maxSteps` is the soft
- * step-count cap (DAG_PLAN_MAX_STEPS) interpolated into the size guidance;
+ * step-count cap (config "maxSteps") interpolated into the size guidance;
  * the hard ceiling is enforced by validatePlan, not by this prompt.
  */
 export function plannerSystemPrompt(maxSteps: number): string {
@@ -95,24 +96,29 @@ export const PLANNER_EXPLORE_TOOLS = ["read", "grep", "find", "ls"];
 
 /**
  * Whether the planner explores the repo before planning (default: yes).
- * Set DAG_PLAN_PLANNER_EXPLORE=0/false/off for the fast blind single call.
+ * Set plannerExplore: false in the config for the fast blind single call.
  */
-export function plannerExplores(): boolean {
-	const raw = (process.env.DAG_PLAN_PLANNER_EXPLORE ?? "").trim().toLowerCase();
-	return raw !== "0" && raw !== "false" && raw !== "off";
+export function plannerExplores(config?: DagPlanConfig): boolean {
+	return config?.plannerExplore ?? true;
 }
 
 /**
  * pi CLI flags for the exploring planner subagent: read-only tools, no
- * extensions/skills/context files, its own system prompt. `maxSteps` (soft
- * cap) defaults to DAG_PLAN_MAX_STEPS and is interpolated into the prompt.
+ * auto-discovered extensions/skills/context files, its own system prompt.
+ * `config.maxSteps` (soft cap, default DEFAULT_MAX_STEPS) is interpolated
+ * into the prompt. Configured `config.plannerExtensions` are loaded on top
+ * of the lockdown via -e; when any are present the read-only `--tools`
+ * allow-list is dropped, since --tools is a strict allow-list that would
+ * otherwise hide the extensions' extra tools.
  */
-export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, maxSteps: number = getMaxSteps()): string[] {
+export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	args.push("--no-extensions", "--no-skills", "--no-context-files");
-	args.push("--tools", PLANNER_EXPLORE_TOOLS.join(","));
-	args.push("--system-prompt", plannerSystemPrompt(maxSteps));
+	const plannerExtensions = config?.plannerExtensions ?? [];
+	for (const ext of plannerExtensions) args.push("-e", ext);
+	if (plannerExtensions.length === 0) args.push("--tools", PLANNER_EXPLORE_TOOLS.join(","));
+	args.push("--system-prompt", plannerSystemPrompt(getMaxSteps(config)));
 	return args;
 }
 
@@ -197,6 +203,8 @@ export interface PlanOptions {
 	feedback?: string;
 	/** The prior plan JSON, when re-planning after refine. */
 	priorPlanJson?: string;
+	/** The dag-plan config for this run (defaults apply when omitted). */
+	config?: DagPlanConfig;
 	/** Live planner activity (formatted tool-call snippets) for the UI. */
 	onExplore?: (snippet: string) => void;
 	/** Test seam: replace the planner subprocess spawn. */
@@ -206,8 +214,8 @@ export interface PlanOptions {
 /**
  * Produce a plan. Default: the planner runs as a read-only pi subagent that
  * explores the repo, and the plan JSON is extracted from its final message.
- * With DAG_PLAN_PLANNER_EXPLORE=0: single blind LLM completion. Returns null
- * when aborted (Esc), throws with a diagnostic otherwise.
+ * With plannerExplore: false (config): single blind LLM completion. Returns
+ * null when aborted (Esc), throws with a diagnostic otherwise.
  */
 export async function plan(
 	ctx: ExtensionCommandContext,
@@ -217,6 +225,7 @@ export async function plan(
 ): Promise<PlannerResult | null> {
 	const model = ctx.model;
 	if (!model) throw new Error("no model selected (use /model)");
+	const cfg = opts.config ?? DEFAULT_CONFIG;
 
 	const parts: string[] = [`Plan this task:\n\n${prompt}`];
 	if (opts.priorPlanJson) parts.push(`A previous plan:\n\n${opts.priorPlanJson}`);
@@ -226,8 +235,8 @@ export async function plan(
 		);
 	const userText = parts.join("\n\n");
 
-	if (plannerExplores()) {
-		return planExploring(ctx, userText, opts, signal);
+	if (plannerExplores(cfg)) {
+		return planExploring(ctx, userText, opts, cfg, signal);
 	}
 
 	const userMessage: UserMessage = {
@@ -238,7 +247,7 @@ export async function plan(
 
 	const response = await ctx.modelRegistry.complete(
 		model,
-		{ systemPrompt: blindPlannerPrompt(getMaxSteps()), messages: [userMessage] },
+		{ systemPrompt: blindPlannerPrompt(getMaxSteps(cfg)), messages: [userMessage] },
 		{ signal },
 	);
 
@@ -251,7 +260,7 @@ export async function plan(
 		.join("\n");
 
 	const { plan: planObj, json } = extractPlanJson(text);
-	const validation = validatePlan(planObj);
+	const validation = validatePlan(planObj, cfg);
 	if (!validation.ok) throw new Error(`invalid plan: ${validation.error}`);
 
 	return { plan: planObj, rawJson: json, usage: toUsageStats(response.usage) };
@@ -267,13 +276,14 @@ async function planExploring(
 	ctx: ExtensionCommandContext,
 	userText: string,
 	opts: PlanOptions,
+	cfg: DagPlanConfig,
 	signal?: AbortSignal,
 ): Promise<PlannerResult | null> {
 	const model = ctx.model!;
 	const run = await runPiSubagent({
 		cwd: ctx.cwd,
 		signal: signal ?? new AbortController().signal,
-		args: buildPlannerArgs(`${model.provider}/${model.id}`, ctx.thinkingLevel),
+		args: buildPlannerArgs(`${model.provider}/${model.id}`, ctx.thinkingLevel, cfg),
 		prompt: userText,
 		spawnImpl: opts.spawnImpl,
 		onToolCall: (toolName, args) => opts.onExplore?.(formatSnippetPlain(toolName, args)),
@@ -286,7 +296,7 @@ async function planExploring(
 	if (!run.output.trim()) throw new Error("planner subagent produced no final message");
 
 	const { plan: planObj, json } = extractPlanJson(run.output);
-	const validation = validatePlan(planObj);
+	const validation = validatePlan(planObj, cfg);
 	if (!validation.ok) throw new Error(`invalid plan: ${validation.error}`);
 
 	return { plan: planObj, rawJson: json, usage: run.usage };

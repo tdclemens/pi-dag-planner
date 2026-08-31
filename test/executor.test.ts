@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
 import { buildTaskPrompt, getMaxParallel, runPiSubagent, runPlan } from "../src/executor.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -123,21 +124,11 @@ function collectEvents() {
 // Tests
 // ---------------------------------------------------------------------------
 
-test("getMaxParallel reads DAG_PLAN_MAX_PARALLEL", () => {
-	const old = process.env.DAG_PLAN_MAX_PARALLEL;
-	try {
-		process.env.DAG_PLAN_MAX_PARALLEL = "7";
-		assert.equal(getMaxParallel(), 7);
-		process.env.DAG_PLAN_MAX_PARALLEL = "0";
-		assert.equal(getMaxParallel(), 4);
-		process.env.DAG_PLAN_MAX_PARALLEL = "abc";
-		assert.equal(getMaxParallel(), 4);
-		delete process.env.DAG_PLAN_MAX_PARALLEL;
-		assert.equal(getMaxParallel(), 4);
-	} finally {
-		if (old === undefined) delete process.env.DAG_PLAN_MAX_PARALLEL;
-		else process.env.DAG_PLAN_MAX_PARALLEL = old;
-	}
+test("getMaxParallel reads the config cap (default 4)", () => {
+	assert.equal(getMaxParallel(), 4);
+	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 7 }), 7);
+	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 0 }), 4);
+	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 1.5 }), 4);
 });
 
 test("runPlan executes independent nodes in parallel within the bound", async () => {
@@ -598,4 +589,33 @@ test("runPlan injects the lock-guard extension and DAG_NODE_ID into every node s
 		assert.ok(rec.env && /^s[12]$/.test(rec.env.DAG_NODE_ID ?? ""), `DAG_NODE_ID missing in ${JSON.stringify(rec.env)}`);
 	}
 	assert.notEqual(h.spawns[0]!.env?.DAG_NODE_ID, h.spawns[1]!.env?.DAG_NODE_ID);
+});
+
+test("runPlan loads configured runner extensions into every node subagent", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2")] };
+	const h = makeHarness();
+	await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		config: { ...DEFAULT_CONFIG, runnerExtensions: ["/tmp/runner-extra.ts"] },
+	});
+	assert.equal(h.spawns.length, 2);
+	for (const rec of h.spawns) {
+		const loaded = rec.args.flatMap((a, i) => (a === "-e" ? [rec.args[i + 1]!] : []));
+		assert.ok(loaded.some((p) => p.endsWith("lock-guard.ts")), "lock-guard still loaded");
+		assert.ok(loaded.includes("/tmp/runner-extra.ts"), `runner extension missing in ${rec.args.join(" ")}`);
+	}
+});
+
+test("runPlan honors config maxParallel as the concurrency bound", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2"), node("s3")] };
+	const h = makeHarness();
+	await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		config: { ...DEFAULT_CONFIG, maxParallel: 2 },
+	});
+	assert.equal(h.maxActive, 2);
 });

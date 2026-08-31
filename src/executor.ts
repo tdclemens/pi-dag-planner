@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { dependentsIndex, validatePlan } from "./dag.ts";
+import type { DagPlanConfig } from "./config.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, UsageStats } from "./types.ts";
 import { addUsage, emptyUsage } from "./types.ts";
 
@@ -29,13 +30,10 @@ const STDERR_CAP = 2000;
  */
 const LOCK_GUARD_PATH = fileURLToPath(new URL("./lock-guard.ts", import.meta.url));
 
-/** Concurrency from DAG_PLAN_MAX_PARALLEL (registerFlag is bool/string only). */
-export function getMaxParallel(): number {
-	const raw = process.env.DAG_PLAN_MAX_PARALLEL;
-	if (raw) {
-		const n = Number.parseInt(raw, 10);
-		if (Number.isFinite(n) && n >= 1) return n;
-	}
+/** Concurrency from config "maxParallel" (defaults to DEFAULT_MAX_PARALLEL). */
+export function getMaxParallel(config?: DagPlanConfig): number {
+	const n = config?.maxParallel;
+	if (typeof n === "number" && Number.isInteger(n) && n >= 1) return n;
 	return DEFAULT_MAX_PARALLEL;
 }
 
@@ -105,6 +103,11 @@ export interface RunPlanOptions {
 	thinkingLevel?: string;
 	maxParallel?: number;
 	/**
+	 * The dag-plan config for this run (defaults apply to anything omitted).
+	 * Used for maxParallel, plan validation caps, and runnerExtensions.
+	 */
+	config?: DagPlanConfig;
+	/**
 	 * The user's original /dag-plan request, injected verbatim into every node
 	 * prompt so subagents see the full request, not just the one-line goal.
 	 */
@@ -124,11 +127,11 @@ export interface RunPlanOptions {
  * an invalid plan can never continue.
  */
 export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<NodeResult[]> {
-	const validation = validatePlan(plan);
+	const validation = validatePlan(plan, opts.config);
 	if (!validation.ok) throw new Error(`refusing to execute plan: ${validation.error}`);
 
 	const steps = plan.steps;
-	const maxParallel = Math.max(1, opts.maxParallel ?? getMaxParallel());
+	const maxParallel = Math.max(1, opts.maxParallel ?? getMaxParallel(opts.config));
 	const onEvent = opts.onEvent ?? (() => {});
 	const dependents = dependentsIndex(steps);
 
@@ -433,6 +436,10 @@ async function runNodeSubagent(
 	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "-e", LOCK_GUARD_PATH];
+	// Configured extra extensions (resolved absolute paths from the config
+	// file) — additional tools for node subagents when the user opts in via
+	// runnerExtensions. The lock guard stays first (safety-net ordering).
+	for (const ext of opts.config?.runnerExtensions ?? []) args.push("-e", ext);
 	if (opts.model) args.push("--model", opts.model);
 	if (opts.thinkingLevel) args.push("--thinking", opts.thinkingLevel);
 	if (node.tools && node.tools.length > 0) args.push("--tools", node.tools.join(","));

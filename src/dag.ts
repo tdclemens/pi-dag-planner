@@ -1,10 +1,11 @@
 /**
  * Pure DAG utilities: validation (JSON schema + graph rules: cycles, missing
- * deps), Kahn topological levels, dependents index. No pi imports —
- * unit-testable on its own.
+ * deps), Kahn topological levels, dependents index. No runtime pi imports —
+ * unit-testable on its own (the DagPlanConfig import is type-only).
  */
 
 import { validatePlanSchema } from "./schema.ts";
+import type { DagPlanConfig } from "./config.ts";
 import type { DagNode, DagPlan, PlanValidation } from "./types.ts";
 
 export type { PlanValidation };
@@ -19,19 +20,16 @@ export const DEFAULT_MAX_STEPS = 12;
  */
 export const HARD_MAX_STEPS = 32;
 
-/** Soft step count from DAG_PLAN_MAX_STEPS (defaults to DEFAULT_MAX_STEPS). */
-export function getMaxSteps(): number {
-	const raw = process.env.DAG_PLAN_MAX_STEPS;
-	if (raw) {
-		const n = Number.parseInt(raw, 10);
-		if (Number.isFinite(n) && n >= 1) return n;
-	}
+/** Soft step count from config "maxSteps" (defaults to DEFAULT_MAX_STEPS). */
+export function getMaxSteps(config?: DagPlanConfig): number {
+	const n = config?.maxSteps;
+	if (typeof n === "number" && Number.isInteger(n) && n >= 1) return n;
 	return DEFAULT_MAX_STEPS;
 }
 
 /** Hard ceiling: the configured soft cap may raise it, but never lower it. */
-export function getHardMaxSteps(): number {
-	return Math.max(HARD_MAX_STEPS, getMaxSteps());
+export function getHardMaxSteps(config?: DagPlanConfig): number {
+	return Math.max(HARD_MAX_STEPS, getMaxSteps(config));
 }
 
 /**
@@ -51,16 +49,16 @@ export function getHardMaxSteps(): number {
  * approving. Likewise, exceeding the soft step cap (getMaxSteps) is a
  * warning, not a rejection.
  */
-export function validatePlan(plan: unknown): PlanValidation {
+export function validatePlan(plan: unknown, config?: DagPlanConfig): PlanValidation {
 	const schema = validatePlanSchema(plan);
 	if (!schema.ok) return schema;
 	const steps = (plan as DagPlan).steps;
 
-	const hardMax = getHardMaxSteps();
+	const hardMax = getHardMaxSteps(config);
 	if (steps.length > hardMax)
 		return {
 			ok: false,
-			error: `plan has ${steps.length} steps; hard limit is ${hardMax} (raise DAG_PLAN_MAX_STEPS to allow larger plans)`,
+			error: `plan has ${steps.length} steps; hard limit is ${hardMax} (raise "maxSteps" in the dag-plan.json config to allow larger plans)`,
 		};
 
 	const seen = new Set<string>();
@@ -78,10 +76,10 @@ export function validatePlan(plan: unknown): PlanValidation {
 	const cycle = findCycle(steps);
 	if (cycle) return { ok: false, error: `cycle detected: ${cycle.join(" → ")}` };
 	const warnings: string[] = [];
-	const softMax = getMaxSteps();
+	const softMax = getMaxSteps(config);
 	if (steps.length > softMax)
 		warnings.push(
-			`plan has ${steps.length} steps (recommended max ${softMax}; env DAG_PLAN_MAX_STEPS) — each step is a separate agent session, review before executing`,
+			`plan has ${steps.length} steps (recommended max ${softMax} — raise "maxSteps" in dag-plan.json) — each step is a separate agent session, review before executing`,
 		);
 	warnings.push(...touchesOverlapWarnings(steps));
 	return warnings.length > 0 ? { ok: true, warnings } : { ok: true };

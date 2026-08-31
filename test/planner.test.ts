@@ -12,6 +12,7 @@ import {
 	plannerSystemPrompt,
 } from "../src/planner.ts";
 import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
 
 test("extractPlanJson parses raw JSON", () => {
 	const raw = JSON.stringify({
@@ -172,7 +173,7 @@ function assistantMessage(text: string, extra: Record<string, unknown> = {}) {
 }
 
 test("buildPlannerArgs pins a read-only, extension-free planner subagent", () => {
-	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium", 12), [
+	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium", { ...DEFAULT_CONFIG, maxSteps: 12 }), [
 		"--mode", "json", "-p", "--no-session",
 		"--model", "anthropic/claude-x",
 		"--thinking", "medium",
@@ -182,19 +183,30 @@ test("buildPlannerArgs pins a read-only, extension-free planner subagent", () =>
 	]);
 });
 
-test("buildPlannerArgs defaults maxSteps from DAG_PLAN_MAX_STEPS", () => {
-	const saved = process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		delete process.env.DAG_PLAN_MAX_STEPS;
-		const def = buildPlannerArgs("p/m");
-		assert.equal(def[def.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
-		process.env.DAG_PLAN_MAX_STEPS = "20";
-		const custom = buildPlannerArgs("p/m");
-		assert.equal(custom[custom.indexOf("--system-prompt") + 1], plannerSystemPrompt(20));
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = saved;
-	}
+test("buildPlannerArgs interpolates the configured (or default) soft cap", () => {
+	const def = buildPlannerArgs("p/m");
+	assert.equal(def[def.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
+	const custom = buildPlannerArgs("p/m", undefined, { ...DEFAULT_CONFIG, maxSteps: 20 });
+	assert.equal(custom[custom.indexOf("--system-prompt") + 1], plannerSystemPrompt(20));
+});
+
+test("buildPlannerArgs loads configured planner extensions and drops the read-only tool lock", () => {
+	const cfg = { ...DEFAULT_CONFIG, plannerExtensions: ["/tmp/plan-ext.ts", "/tmp/other.ts"] };
+	const args = buildPlannerArgs("p/m", undefined, cfg);
+	assert.deepEqual(args.slice(args.indexOf("-e"), args.indexOf("--system-prompt")), [
+		"-e",
+		"/tmp/plan-ext.ts",
+		"-e",
+		"/tmp/other.ts",
+	]);
+	assert.ok(!args.includes("--tools"), "no strict --tools allow-list once extensions add tools");
+	assert.ok(
+		args.includes("--no-extensions") && args.includes("--no-skills") && args.includes("--no-context-files"),
+		"still locked down from auto-discovery",
+	);
+	// without extensions the read-only tool set returns
+	const bare = buildPlannerArgs("p/m");
+	assert.equal(bare[bare.indexOf("--tools") + 1], "read,grep,find,ls");
 });
 
 test("planner prompts interpolate the soft step cap", () => {
@@ -221,158 +233,90 @@ test("agentic prompt requires exploration + verification; both prompts contract 
 	assert.match(blindPlannerPrompt(12), /serialized at run time/);
 });
 
-test("plannerExplores env parsing (on by default)", () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		assert.equal(plannerExplores(), true);
-		process.env.DAG_PLAN_PLANNER_EXPLORE = "1";
-		assert.equal(plannerExplores(), true);
-		for (const off of ["0", "false", "off", " OFF "]) {
-			process.env.DAG_PLAN_PLANNER_EXPLORE = off;
-			assert.equal(plannerExplores(), false);
-		}
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+test("plannerExplores reads the config flag (on by default)", () => {
+	assert.equal(plannerExplores(), true);
+	assert.equal(plannerExplores({ ...DEFAULT_CONFIG, plannerExplore: true }), true);
+	assert.equal(plannerExplores({ ...DEFAULT_CONFIG, plannerExplore: false }), false);
 });
 
 test("plan() explores via subprocess and extracts the plan", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	const savedSteps = process.env.DAG_PLAN_MAX_STEPS;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		const snippets: string[] = [];
-		const result = await plan(fakeCtx(), "Add tests", {
-			onExplore: (s) => snippets.push(s),
-			spawnImpl: (_command, args, cwd) => {
-				assert.equal(cwd, "/tmp/repo");
-				assert.equal(args[args.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
-				assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
-				return fakeProc([
-					{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
-					{ type: "message_end", message: assistantMessage(`Plan:\n\n\u0060\u0060\u0060json\n${validPlanJson}\n\u0060\u0060\u0060`) },
-				]);
-			},
-		});
-		assert.ok(result);
-		assert.equal(result!.plan.steps.length, 2);
-		assert.equal(result!.usage.input, 10);
-		assert.equal(result!.usage.turns, 1);
-		assert.deepEqual(snippets, ["read package.json"]);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-		if (savedSteps === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = savedSteps;
-	}
+	const snippets: string[] = [];
+	const result = await plan(fakeCtx(), "Add tests", {
+		onExplore: (s) => snippets.push(s),
+		spawnImpl: (_command, args, cwd) => {
+			assert.equal(cwd, "/tmp/repo");
+			assert.equal(args[args.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
+			assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+			return fakeProc([
+				{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
+				{ type: "message_end", message: assistantMessage(`Plan:\n\n\u0060\u0060\u0060json\n${validPlanJson}\n\u0060\u0060\u0060`) },
+			]);
+		},
+	});
+	assert.ok(result);
+	assert.equal(result!.plan.steps.length, 2);
+	assert.equal(result!.usage.input, 10);
+	assert.equal(result!.usage.turns, 1);
+	assert.deepEqual(snippets, ["read package.json"]);
 });
 
 test("plan() returns null when aborted", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		const ctrl = new AbortController();
-		ctrl.abort();
-		const result = await plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 130) }, ctrl.signal);
-		assert.equal(result, null);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+	const ctrl = new AbortController();
+	ctrl.abort();
+	const result = await plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 130) }, ctrl.signal);
+	assert.equal(result, null);
 });
 
 test("plan() throws a diagnostic when the planner subagent fails", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		await assert.rejects(
-			plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 1, "npm: command not found") }),
-			/command not found/,
-		);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+	await assert.rejects(
+		plan(fakeCtx(), "x", { spawnImpl: () => fakeProc([], 1, "npm: command not found") }),
+		/command not found/,
+	);
 });
 
 test("plan() throws when the planner output is not a valid plan", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		await assert.rejects(
-			plan(fakeCtx(), "x", {
-				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage("I cannot do that.") }]),
-			}),
-			/not a valid plan/,
-		);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+	await assert.rejects(
+		plan(fakeCtx(), "x", {
+			spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage("I cannot do that.") }]),
+		}),
+		/not a valid plan/,
+	);
 });
 
 test("plan() automatically rejects a cyclic plan (schema + cycle check)", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		await assert.rejects(
-			plan(fakeCtx(), "x", {
-				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(cyclicPlanJson) }]),
-			}),
-			/invalid plan: cycle detected: s1 → s2 → s1/,
-		);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+	await assert.rejects(
+		plan(fakeCtx(), "x", {
+			spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(cyclicPlanJson) }]),
+		}),
+		/invalid plan: cycle detected: s1 → s2 → s1/,
+	);
 });
 
 test("plan() automatically rejects a plan that fails the JSON schema", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-	try {
-		await assert.rejects(
-			plan(fakeCtx(), "x", {
-				spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(malformedPlanJson) }]),
-			}),
-			/invalid plan: .*must match/,
-		);
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-	}
+	await assert.rejects(
+		plan(fakeCtx(), "x", {
+			spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(malformedPlanJson) }]),
+		}),
+		/invalid plan: .*must match/,
+	);
 });
 
 test("plan() uses the blind single completion when exploration is disabled", async () => {
-	const saved = process.env.DAG_PLAN_PLANNER_EXPLORE;
-	const savedSteps = process.env.DAG_PLAN_MAX_STEPS;
-	process.env.DAG_PLAN_PLANNER_EXPLORE = "0";
-	delete process.env.DAG_PLAN_MAX_STEPS;
-	try {
-		let capturedSystemPrompt: string | undefined;
-		const ctx: any = {
-			...fakeCtx(),
-			modelRegistry: {
-				complete: async (_model: unknown, req: { systemPrompt: string }) => {
-					capturedSystemPrompt = req.systemPrompt;
-					return {
-						stopReason: "stop",
-						content: [{ type: "text", text: validPlanJson }],
-						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-					};
-				},
+	let capturedSystemPrompt: string | undefined;
+	const ctx: any = {
+		...fakeCtx(),
+		modelRegistry: {
+			complete: async (_model: unknown, req: { systemPrompt: string }) => {
+				capturedSystemPrompt = req.systemPrompt;
+				return {
+					stopReason: "stop",
+					content: [{ type: "text", text: validPlanJson }],
+					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+				};
 			},
-		};
-		const result = await plan(ctx, "x");
-		assert.ok(result);
-		assert.equal(capturedSystemPrompt, blindPlannerPrompt(DEFAULT_MAX_STEPS));
-	} finally {
-		if (saved === undefined) delete process.env.DAG_PLAN_PLANNER_EXPLORE;
-		else process.env.DAG_PLAN_PLANNER_EXPLORE = saved;
-		if (savedSteps === undefined) delete process.env.DAG_PLAN_MAX_STEPS;
-		else process.env.DAG_PLAN_MAX_STEPS = savedSteps;
-	}
+		},
+	};
+	const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+	assert.ok(result);
+	assert.equal(capturedSystemPrompt, blindPlannerPrompt(DEFAULT_MAX_STEPS));
 });

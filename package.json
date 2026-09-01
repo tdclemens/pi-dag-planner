@@ -2,6 +2,7 @@
 	"name": "pi-dag-plan",
 	"version": "0.1.0",
 	"description": "pi extension: /dag-plan — plan a DAG of subagent steps and execute them in parallel with live progress",
+	"license": "MIT",
 	"type": "module",
 	"keywords": [
 		"pi-package"

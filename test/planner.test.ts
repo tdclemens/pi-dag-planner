@@ -7,12 +7,16 @@ import {
 	blindPlannerPrompt,
 	extractPlanJson,
 	normalizePlan,
+	PlanError,
 	plannerExplores,
 	plan,
+	planWithRetries,
 	plannerSystemPrompt,
+	PLANNER_MAX_ATTEMPTS,
 } from "../src/planner.ts";
 import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { emptyUsage } from "../src/types.ts";
 
 test("extractPlanJson parses raw JSON", () => {
 	const raw = JSON.stringify({
@@ -319,4 +323,211 @@ test("plan() uses the blind single completion when exploration is disabled", asy
 	const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
 	assert.ok(result);
 	assert.equal(capturedSystemPrompt, blindPlannerPrompt(DEFAULT_MAX_STEPS));
+});
+
+// ---------------------------------------------------------------------------
+// planWithRetries: bounded retry loop shared by initial planning and refine
+// ---------------------------------------------------------------------------
+
+const retryPlanResult = {
+	plan: { goal: "G", steps: [{ id: "s1", title: "T", prompt: "P", dependsOn: [] }] },
+	rawJson: "{}",
+	usage: emptyUsage(),
+};
+
+test("planWithRetries retries with the error as feedback and the raw output as prior", async () => {
+	const calls: { feedback?: string; prior?: string }[] = [];
+	const broken = '{"goal": "G", "steps": [';
+	const outcome = await planWithRetries(async (feedback, prior) => {
+		calls.push({ feedback, prior });
+		if (calls.length === 1)
+			return {
+				error: "planner output is not a valid plan JSON (Unterminated string in JSON at position 10)",
+				rawOutput: broken,
+			};
+		return retryPlanResult;
+	});
+	assert.equal(outcome.ok, true);
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0].feedback, undefined);
+	assert.equal(calls[0].prior, undefined);
+	assert.equal(
+		calls[1].feedback,
+		"planner output is not a valid plan JSON (Unterminated string in JSON at position 10)",
+	);
+	assert.equal(calls[1].prior, broken, "failed raw output is fed back as the prior plan");
+});
+
+test("planWithRetries keeps initial feedback and appends the latest error", async () => {
+	const calls: { feedback?: string; prior?: string }[] = [];
+	await planWithRetries(
+		async (feedback, prior) => {
+			calls.push({ feedback, prior });
+			return { error: "invalid plan: cycle detected: s1 → s2 → s1", rawOutput: "failed-output" };
+		},
+		{ initialFeedback: "split into smaller steps", initialPriorJson: "gate-json" },
+	);
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0].feedback, "split into smaller steps");
+	assert.equal(calls[0].prior, "gate-json");
+	assert.equal(calls[1].feedback, "split into smaller steps\n\nLatest error: invalid plan: cycle detected: s1 → s2 → s1");
+	assert.equal(calls[1].prior, "failed-output");
+});
+
+test("planWithRetries gives up after PLANNER_MAX_ATTEMPTS", async () => {
+	let attempts = 0;
+	const outcome = await planWithRetries(async () => {
+		attempts++;
+		return { error: `fail ${attempts}` };
+	});
+	assert.deepEqual(outcome, { ok: false, aborted: false, error: "fail 2" });
+	assert.equal(attempts, PLANNER_MAX_ATTEMPTS);
+});
+
+test("planWithRetries does not retry on abort", async () => {
+	let attempts = 0;
+	const aborted = await planWithRetries(async () => {
+		attempts++;
+		return null;
+	});
+	assert.deepEqual(aborted, { ok: false, aborted: true, error: null });
+	assert.equal(attempts, 1);
+
+	attempts = 0;
+	const preAborted = await planWithRetries(
+		async () => {
+			attempts++;
+			return { error: "x" };
+		},
+		{ isAborted: () => true },
+	);
+	assert.deepEqual(preAborted, { ok: false, aborted: true, error: null });
+	assert.equal(attempts, 0, "aborted before the first attempt");
+});
+
+test("planWithRetries keeps the prior output when a failure has no raw output", async () => {
+	const calls: { prior?: string }[] = [];
+	await planWithRetries(
+		async (_feedback, prior) => {
+			calls.push({ prior });
+			return { error: "planner subagent exited with code 1" };
+		},
+		{ initialPriorJson: "gate-json" },
+	);
+	assert.equal(calls[0].prior, "gate-json");
+	assert.equal(calls[1].prior, "gate-json", "spawn failure carries no raw output; keep the prior plan");
+});
+
+// ---------------------------------------------------------------------------
+// PlanError: raw output attached to parse/validation failures, and the
+// retry prompt (prior output + truncation hint + cap)
+// ---------------------------------------------------------------------------
+
+const truncatedPlanText = '{"goal": "G", "steps": [{"id": "s1", "title": "T", "prompt": "cut off mid';
+
+test("plan() throws PlanError carrying the raw output on parse failure", async () => {
+	await assert.rejects(
+		plan(fakeCtx(), "x", {
+			spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(truncatedPlanText) }]),
+		}),
+		(e: unknown) => {
+			assert.ok(e instanceof PlanError, `expected PlanError, got: ${e}`);
+			assert.match(e.message, /not a valid plan/);
+			assert.equal(e.rawOutput, truncatedPlanText);
+			return true;
+		},
+	);
+});
+
+test("plan() throws PlanError carrying the normalized JSON on validation failure", async () => {
+	await assert.rejects(
+		plan(fakeCtx(), "x", {
+			spawnImpl: () => fakeProc([{ type: "message_end", message: assistantMessage(cyclicPlanJson) }]),
+		}),
+		(e: unknown) => {
+			assert.ok(e instanceof PlanError, `expected PlanError, got: ${e}`);
+			assert.match(e.message, /invalid plan: cycle detected/);
+			assert.deepEqual(JSON.parse(e.rawOutput!), JSON.parse(cyclicPlanJson));
+			return true;
+		},
+	);
+});
+
+test("plan() retry prompt includes the failed output and a conciseness hint for truncation", async () => {
+	const prompts: string[] = [];
+	const outcome = await planWithRetries(async (feedback, prior) => {
+		try {
+			return await plan(fakeCtx(), "Add tests", {
+				feedback,
+				priorPlanJson: prior,
+				spawnImpl: (_command, args) => {
+					prompts.push(args[args.length - 1]);
+					return fakeProc([{ type: "message_end", message: assistantMessage(truncatedPlanText) }]);
+				},
+			});
+		} catch (e) {
+			if (e instanceof PlanError) return { error: e.message, rawOutput: e.rawOutput };
+			throw e;
+		}
+	});
+	assert.equal(outcome.ok, false);
+	assert.equal(prompts.length, 2);
+	assert.ok(!prompts[0].includes("previous attempt"), "first attempt has no prior output");
+	assert.match(prompts[1], /A previous attempt's output/, "retry includes the failed output");
+	assert.ok(prompts[1].includes(truncatedPlanText), "retry includes the raw broken text");
+	assert.match(prompts[1], /cut off before the JSON was complete/i, "truncation hint present");
+	assert.match(prompts[1], /more concise plan/i);
+});
+
+test("plan() blind path attaches the raw output and honors the truncation hint", async () => {
+	let capturedText: string | undefined;
+	const ctx: any = {
+		...fakeCtx(),
+		modelRegistry: {
+			complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
+				capturedText = req.messages[0].content[0].text;
+				return {
+					stopReason: "stop",
+					content: [{ type: "text", text: truncatedPlanText }],
+					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+				};
+			},
+		},
+	};
+	await assert.rejects(
+		plan(ctx, "x", {
+			config: { ...DEFAULT_CONFIG, plannerExplore: false },
+			feedback: "planner output is not a valid plan JSON (Unterminated string in JSON at position 5)",
+			priorPlanJson: truncatedPlanText,
+		}),
+		(e: unknown) => {
+			assert.ok(e instanceof PlanError, `expected PlanError, got: ${e}`);
+			assert.equal(e.rawOutput, truncatedPlanText);
+			return true;
+		},
+	);
+	assert.ok(capturedText!.includes(truncatedPlanText), "prior output included in the prompt");
+	assert.match(capturedText!, /more concise plan/i, "truncation hint included");
+});
+
+test("plan() caps very large prior output, keeping the tail", async () => {
+	let capturedText: string | undefined;
+	const ctx: any = {
+		...fakeCtx(),
+		modelRegistry: {
+			complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
+				capturedText = req.messages[0].content[0].text;
+				return {
+					stopReason: "stop",
+					content: [{ type: "text", text: validPlanJson }],
+					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+				};
+			},
+		},
+	};
+	const prior = "HEAD-MARKER-".padEnd(12000, "x") + "TAIL-MARKER-".padEnd(12000, "y");
+	await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false }, priorPlanJson: prior });
+	assert.match(capturedText!, /earlier output elided/);
+	assert.ok(capturedText!.includes("TAIL-MARKER"), "tail kept");
+	assert.ok(!capturedText!.includes("HEAD-MARKER"), "head elided");
 });

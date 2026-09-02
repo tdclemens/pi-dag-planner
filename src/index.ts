@@ -2,7 +2,8 @@
  * /dag-plan — plan a DAG of subagent steps and execute it in parallel.
  *
  *   1. Plan:  LLM call (BorderedLoader, cancellable); on invalid JSON retry
- *             once with the error as feedback. Plan saved to ~/.agents/plans/.
+ *             once with the error + the failed raw output as feedback. Plan
+ *             saved to ~/.agents/plans/.
  *   2. Gate:  select Execute / Refine (≤3, with feedback) / Reject.
  *   3. Run:   live RunDashboard (custom UI, esc cancels); nodes run as
  *             parallel pi subprocesses; each finished node appends a
@@ -18,7 +19,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { runPlan } from "./executor.ts";
 import { loadConfig, type DagPlanConfig } from "./config.ts";
-import { plan, plannerExplores, PLANNER_MAX_ATTEMPTS } from "./planner.ts";
+import { plan, plannerExplores, PlanError, planWithRetries, type PlanRetryFailure } from "./planner.ts";
 import * as plans from "./plans.ts";
 import { validatePlan } from "./dag.ts";
 import type { DagEvent, NodeResult, PlannerResult } from "./types.ts";
@@ -40,8 +41,6 @@ const SUMMARY_MESSAGE_TYPE = "dag-plan-summary";
 const NODE_ENTRY_TYPE = "dag-node";
 const MAX_REFINE_ATTEMPTS = 3;
 const STATUS_KEY = "dag-runner";
-
-type PlanPhaseOutcome = { ok: true; result: PlannerResult } | { ok: false; error: string };
 
 export default function dagPlanExtension(pi: ExtensionAPI): void {
 	let activeRun: { abort: () => void } | undefined;
@@ -97,30 +96,20 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		}
 
 		// ------------------------------------------------------------------
-		// Phase 1: plan (initial call + retries on bad JSON / invalid plan)
+		// Phase 1: plan (bounded retries on bad JSON / invalid plan; the
+		// failed attempt's raw output is fed back so the retry can see it)
 		// ------------------------------------------------------------------
-		let planResult: PlannerResult | undefined;
-		let planFeedback: string | undefined;
-		let planPriorJson: string | undefined;
 		const planStartedAt = Date.now();
-
-		for (let attempt = 1; ; attempt++) {
-			if (signal.aborted) return;
-			const outcome = await planOnce(ctx, prompt, modelLabel, config, planFeedback, planPriorJson);
-			if (outcome === null) return; // Esc during planning
-			if (outcome.ok) {
-				planResult = outcome.result;
-				break;
-			}
-			if (attempt >= PLANNER_MAX_ATTEMPTS) {
-				ctx.ui.notify(`Could not get a valid plan: ${outcome.error}`, "error");
-				return;
-			}
-			planFeedback = outcome.error;
+		const planOutcome = await planWithRetries((fb, prior) => planOnce(ctx, prompt, modelLabel, config, fb, prior), {
+			isAborted: () => signal.aborted,
+		});
+		if (!planOutcome.ok) {
+			if (!planOutcome.aborted) ctx.ui.notify(`Could not get a valid plan: ${planOutcome.error}`, "error");
+			return; // aborted (Esc / session) or retries exhausted
 		}
 		const planDurationMs = Date.now() - planStartedAt;
 
-		const current = await presentPlan(ctx, planResult!, prompt, planDurationMs);
+		const current = await presentPlan(ctx, planOutcome.result, prompt, planDurationMs);
 		if (!current) return;
 
 		// ------------------------------------------------------------------
@@ -147,10 +136,13 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			refineAttempts++;
 
 			const rePlanStartedAt = Date.now();
-			const reOutcome = await planOnce(ctx, prompt, modelLabel, config, fb.trim() || undefined, gate.rawJson);
-			if (reOutcome === null) return;
+			const reOutcome = await planWithRetries((f, prior) => planOnce(ctx, prompt, modelLabel, config, f, prior), {
+				initialFeedback: fb.trim() || undefined,
+				initialPriorJson: gate.rawJson,
+				isAborted: () => signal.aborted,
+			});
 			if (!reOutcome.ok) {
-				ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
+				if (!reOutcome.aborted) ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
 				return;
 			}
 			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
@@ -277,7 +269,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 
 	/**
 	 * One planner LLM call behind a cancellable loader.
-	 * Returns null when aborted (Esc / session), otherwise a tagged outcome.
+	 * Returns null when aborted (Esc / session), the plan on success, or a
+	 * failure (with the raw output attached when the planner produced one).
 	 */
 	function planOnce(
 		ctx: ExtensionCommandContext,
@@ -286,8 +279,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		config: DagPlanConfig,
 		feedback: string | undefined,
 		priorJson: string | undefined,
-	): Promise<PlanPhaseOutcome | null> {
-		return ctx.ui.custom<PlanPhaseOutcome | null>((tui, theme, _kb, done) => {
+	): Promise<PlannerResult | PlanRetryFailure | null> {
+		return ctx.ui.custom<PlannerResult | PlanRetryFailure | null>((tui, theme, _kb, done) => {
 			const label = plannerExplores(config)
 				? `Planning with ${modelLabel} (exploring repo)…`
 				: `Planning with ${modelLabel}…`;
@@ -302,7 +295,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			// Guard: Esc calls done(null) while the (killed) planner subagent may
 			// still settle the promise afterwards — done() must run exactly once.
 			let settled = false;
-			const finish = (outcome: PlanPhaseOutcome | null) => {
+			const finish = (outcome: PlannerResult | PlanRetryFailure | null) => {
 				if (settled) return;
 				settled = true;
 				done(outcome);
@@ -322,8 +315,13 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				},
 				loader.signal,
 			)
-				.then((r) => finish(r ? { ok: true, result: r } : null))
-				.catch((e) => finish({ ok: false, error: e instanceof Error ? e.message : String(e) }));
+				.then((r) => finish(r))
+				.catch((e) =>
+					finish({
+						error: e instanceof Error ? e.message : String(e),
+						rawOutput: e instanceof PlanError ? e.rawOutput : undefined,
+					}),
+				);
 			return loader;
 		});
 	}

@@ -196,12 +196,67 @@ export function normalizePlan(value: unknown): DagPlan | null {
 	return { goal: v.goal.trim(), steps };
 }
 
+/**
+ * Planner failure carrying the raw output that failed to parse/validate, so
+ * a retry can be fed back exactly what the planner produced.
+ */
+export class PlanError extends Error {
+	/** Raw planner output (or normalized JSON) that failed, when available. */
+	rawOutput?: string;
+	constructor(message: string, rawOutput?: string) {
+		super(message);
+		this.name = "PlanError";
+		this.rawOutput = rawOutput;
+	}
+}
+
+/**
+ * Extract + validate the plan from raw planner output. Throws PlanError with
+ * the offending output attached: the raw text for parse failures, the
+ * normalized JSON for validation failures.
+ */
+function extractAndValidate(text: string, cfg: DagPlanConfig): ExtractedPlan {
+	let extracted: ExtractedPlan;
+	try {
+		extracted = extractPlanJson(text);
+	} catch (e) {
+		throw new PlanError(e instanceof Error ? e.message : String(e), text);
+	}
+	const validation = validatePlan(extracted.plan, cfg);
+	if (!validation.ok) throw new PlanError(`invalid plan: ${validation.error}`, extracted.json);
+	return extracted;
+}
+
+/**
+ * Extra guidance appended to retry feedback. "Unterminated string" is the
+ * signature of output truncation (the model hit its max output tokens
+ * mid-JSON); a plain re-roll with the same prompt truncates again, so tell
+ * the planner to be more concise.
+ */
+function retryHintFor(feedback: string): string | undefined {
+	if (/unterminated string/i.test(feedback)) {
+		return "Your previous response was cut off before the JSON was complete (likely a max-output-token limit). Respond with a more concise plan: fewer steps and shorter step prompts.";
+	}
+	return undefined;
+}
+
+/**
+ * Cap the prior output fed back on retry, keeping the tail: the dominant
+ * failure is output truncation, and the parse-error position points near
+ * the end of the output.
+ */
+const MAX_PRIOR_OUTPUT_CHARS = 20000;
+function capPriorOutput(text: string): string {
+	if (text.length <= MAX_PRIOR_OUTPUT_CHARS) return text;
+	return `…(earlier output elided)…\n${text.slice(-MAX_PRIOR_OUTPUT_CHARS)}`;
+}
+
 export const PLANNER_MAX_ATTEMPTS = 2;
 
 export interface PlanOptions {
 	/** User feedback (refine) or prior validation error (retry). */
 	feedback?: string;
-	/** The prior plan JSON, when re-planning after refine. */
+	/** The prior plan JSON (refine) or the failed raw output (retry). */
 	priorPlanJson?: string;
 	/** The dag-plan config for this run (defaults apply when omitted). */
 	config?: DagPlanConfig;
@@ -215,7 +270,8 @@ export interface PlanOptions {
  * Produce a plan. Default: the planner runs as a read-only pi subagent that
  * explores the repo, and the plan JSON is extracted from its final message.
  * With plannerExplore: false (config): single blind LLM completion. Returns
- * null when aborted (Esc), throws with a diagnostic otherwise.
+ * null when aborted (Esc), throws a PlanError with a diagnostic otherwise
+ * (the raw output that failed to parse/validate is attached when available).
  */
 export async function plan(
 	ctx: ExtensionCommandContext,
@@ -228,11 +284,14 @@ export async function plan(
 	const cfg = opts.config ?? DEFAULT_CONFIG;
 
 	const parts: string[] = [`Plan this task:\n\n${prompt}`];
-	if (opts.priorPlanJson) parts.push(`A previous plan:\n\n${opts.priorPlanJson}`);
-	if (opts.feedback)
+	if (opts.priorPlanJson)
+		parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
+	if (opts.feedback) {
+		const hint = retryHintFor(opts.feedback);
 		parts.push(
-			`Address this feedback / error from the previous attempt:\n\n${opts.feedback}\n\nRespond again with ONLY the revised JSON plan.`,
+			`Address this feedback / error from the previous attempt:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond again with ONLY the revised JSON plan.`,
 		);
+	}
 	const userText = parts.join("\n\n");
 
 	if (plannerExplores(cfg)) {
@@ -259,11 +318,52 @@ export async function plan(
 		.map((c) => c.text)
 		.join("\n");
 
-	const { plan: planObj, json } = extractPlanJson(text);
-	const validation = validatePlan(planObj, cfg);
-	if (!validation.ok) throw new Error(`invalid plan: ${validation.error}`);
+	const { plan: planObj, json } = extractAndValidate(text, cfg);
 
 	return { plan: planObj, rawJson: json, usage: toUsageStats(response.usage) };
+}
+
+/** A failed planner attempt: the diagnostic plus the raw output, if any. */
+export interface PlanRetryFailure {
+	/** Diagnostic for the failed attempt. */
+	error: string;
+	/** Raw planner output that failed, when available (fed back on retry). */
+	rawOutput?: string;
+}
+
+export type PlanRetryOutcome =
+	| { ok: true; result: PlannerResult }
+	| { ok: false; aborted: boolean; error: string | null };
+
+/**
+ * Run planner attempts with bounded retries (PLANNER_MAX_ATTEMPTS by
+ * default). `runAttempt` returns the plan, a failure, or null (aborted —
+ * no retry). On failure the loop retries with the error as feedback and
+ * the failed raw output as the prior plan; an initial feedback (e.g. user
+ * refine feedback) is kept and the latest error is appended, so the
+ * planner sees both the intent and what went wrong.
+ */
+export async function planWithRetries(
+	runAttempt: (feedback: string | undefined, priorJson: string | undefined) => Promise<PlannerResult | PlanRetryFailure | null>,
+	opts: {
+		maxAttempts?: number;
+		initialFeedback?: string;
+		initialPriorJson?: string;
+		isAborted?: () => boolean;
+	} = {},
+): Promise<PlanRetryOutcome> {
+	const maxAttempts = opts.maxAttempts ?? PLANNER_MAX_ATTEMPTS;
+	let feedback = opts.initialFeedback;
+	let priorJson = opts.initialPriorJson;
+	for (let attempt = 1; ; attempt++) {
+		if (opts.isAborted?.()) return { ok: false, aborted: true, error: null };
+		const outcome = await runAttempt(feedback, priorJson);
+		if (outcome === null) return { ok: false, aborted: true, error: null };
+		if (!("error" in outcome)) return { ok: true, result: outcome };
+		if (attempt >= maxAttempts) return { ok: false, aborted: false, error: outcome.error };
+		feedback = feedback ? `${feedback}\n\nLatest error: ${outcome.error}` : outcome.error;
+		priorJson = outcome.rawOutput ?? priorJson;
+	}
 }
 
 /**
@@ -293,11 +393,9 @@ async function planExploring(
 		const tail = run.stderr.trim().split("\n").slice(-3).join(" ").slice(-300);
 		throw new Error(run.modelError ?? (tail || `planner subagent exited with code ${run.exitCode}`));
 	}
-	if (!run.output.trim()) throw new Error("planner subagent produced no final message");
+	if (!run.output.trim()) throw new PlanError("planner subagent produced no final message");
 
-	const { plan: planObj, json } = extractPlanJson(run.output);
-	const validation = validatePlan(planObj, cfg);
-	if (!validation.ok) throw new Error(`invalid plan: ${validation.error}`);
+	const { plan: planObj, json } = extractAndValidate(run.output, cfg);
 
 	return { plan: planObj, rawJson: json, usage: run.usage };
 }

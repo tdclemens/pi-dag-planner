@@ -485,6 +485,19 @@ async function runNodeSubagent(
 			const tail = run.stderr.trim().split("\n").slice(-3).join(" ").slice(-500);
 			result.error = tail || `subagent exited with code ${run.exitCode}`;
 		}
+	} else if (run.stopReason === "length") {
+		// The final message was cut off at the model's output-token limit:
+		// the model never finished its turn, so the step cannot be trusted as
+		// complete (its "report" is a fragment, and any tool calls in that
+		// message were discarded by pi).
+		result.status = "failed";
+		result.error ??= "subagent response was truncated (stopReason: length) — the model hit its output-token limit before finishing the step";
+	} else if (result.snippets.length === 0) {
+		// No tool calls at all: the subagent ended without doing any work
+		// (e.g. a single text-only message). Marking it "done" would feed
+		// dependents a report about work that never happened.
+		result.status = "failed";
+		result.error ??= "subagent made no tool calls — it ended without doing any work (empty or truncated response)";
 	} else {
 		result.status = "done";
 	}

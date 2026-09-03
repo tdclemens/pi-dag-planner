@@ -114,13 +114,13 @@ export async function appendResults(planPath: string, results: NodeResult[], tot
 		const rows: string[] = [
 			"## Results",
 			"",
-			"| node | status | duration | output excerpt |",
-			"|------|--------|----------|----------------|",
+			"| node | status | duration | stop | output excerpt |",
+			"|------|--------|----------|------|----------------|",
 		];
 		for (const r of results) {
 			const dur = r.startedAt !== undefined && r.finishedAt !== undefined ? formatDuration(r.finishedAt - r.startedAt) : "—";
 			const excerpt = reportExcerpt(r);
-			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status} | ${dur} | ${excerpt ? tableEscape(excerpt) : "—"} |`);
+			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status} | ${dur} | ${r.stopReason ?? "—"} | ${excerpt ? tableEscape(excerpt) : "—"} |`);
 		}
 		rows.push("");
 		rows.push(

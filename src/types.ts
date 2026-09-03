@@ -111,4 +111,11 @@ export type DagEvent =
 	 * changes (not every scheduler tick).
 	 */
 	| { type: "node-blocked"; nodeId: string; resource: string; heldBy: string }
-	| { type: "node-end"; nodeId: string; result: NodeResult };
+	| { type: "node-end"; nodeId: string; result: NodeResult }
+	/**
+	 * A node that already completed in a prior (interrupted) run and was
+	 * restored from the run-state sidecar at resume time. The dashboard shows
+	 * it as done; unlike node-end the host does not append a transcript entry
+	 * for it.
+	 */
+	| { type: "node-restored"; nodeId: string; result: NodeResult };

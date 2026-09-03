@@ -1,13 +1,16 @@
 /**
  * ~/.agents/plans/ persistence: markdown plan files with embedded JSON and a
- * post-execution Results section. All writes are serialized through a promise
- * chain in this module (extension-owned, no file-mutation queue needed).
+ * post-execution Results section, plus the run-state sidecar
+ * (<plan>.run.json) that makes interrupted runs resumable. All writes are
+ * serialized through a promise chain in this module (extension-owned, no
+ * file-mutation queue needed).
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { topologicalLevels } from "./dag.ts";
+import { normalizePlan } from "./planner.ts";
 import type { DagPlan, NodeResult } from "./types.ts";
 import { formatDuration, reportExcerpt, shortenHome, statusIcon, truncate } from "./ui.ts";
 
@@ -177,4 +180,93 @@ function formatSnippetLine(toolName: string, args: Record<string, unknown>): str
 			return `${toolName} ${truncate(argsStr, 50)}`;
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Run-state sidecar (<plan>.run.json) — resume support
+// ---------------------------------------------------------------------------
+
+/**
+ * Run-state sidecar written next to the plan file during execution:
+ * `<plan>.md` → `<plan>.run.json`. Holds the plan, the original prompt, and
+ * each node's result as it completes, so an interrupted (or failed) run can
+ * be resumed from the last completed node. Written atomically (tmp + rename)
+ * so a crash never leaves a torn file.
+ */
+export interface RunStateFile {
+	version: 1;
+	planPath: string;
+	plan: DagPlan;
+	prompt: string;
+	status: PlanFileStatus;
+	startedAt: number;
+	updatedAt: number;
+	/** Every node that has ended (done/failed/skipped/aborted), by id. */
+	results: Record<string, NodeResult>;
+}
+
+/** Sidecar path for a plan file: `x.md` → `x.run.json`. */
+export function runStatePath(planPath: string): string {
+	return planPath.endsWith(".md") ? planPath.slice(0, -3) + ".run.json" : `${planPath}.run.json`;
+}
+
+/** Write the sidecar atomically (tmp + rename), serialized with plan writes. */
+export async function saveRunState(state: RunStateFile): Promise<void> {
+	return enqueue(async () => {
+		const file = runStatePath(state.planPath);
+		await fs.promises.mkdir(path.dirname(file), { recursive: true });
+		const tmp = `${file}.tmp`;
+		await fs.promises.writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
+		await fs.promises.rename(tmp, file);
+	});
+}
+
+/** Read the sidecar; null when missing, corrupt, or not a v1 run state. */
+export async function loadRunState(planPath: string): Promise<RunStateFile | null> {
+	try {
+		const raw = await fs.promises.readFile(runStatePath(planPath), "utf8");
+		const parsed: unknown = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+		const p = parsed as Record<string, unknown>;
+		if (p.version !== 1) return null;
+		if (!p.plan || typeof p.plan !== "object" || !p.results || typeof p.results !== "object") return null;
+		return parsed as RunStateFile;
+	} catch {
+		return null;
+	}
+}
+
+/** Flip the plan file's `- **Status:**` line (e.g. to "executing" at run start). */
+export async function setPlanFileStatus(planPath: string, status: PlanFileStatus): Promise<void> {
+	return enqueue(async () => {
+		let existing: string;
+		try {
+			existing = await fs.promises.readFile(planPath, "utf8");
+		} catch {
+			return; // no plan file → nothing to flip
+		}
+		const updated = existing.replace(/^(- \*\*Status:\*\* ).*$/m, `$1${status}`);
+		if (updated !== existing) await fs.promises.writeFile(planPath, updated, "utf8");
+	});
+}
+
+/**
+ * Parse the embedded plan JSON out of a saved plan file — the resume
+ * fallback when no sidecar exists (plan never executed, or saved by an
+ * older version).
+ */
+export function extractPlanFromMarkdown(markdown: string): DagPlan | null {
+	const m = markdown.match(/## Plan \(JSON\)\s*\n+```json\s*\n([\s\S]*?)```/);
+	if (!m?.[1]) return null;
+	try {
+		return normalizePlan(JSON.parse(m[1]));
+	} catch {
+		return null;
+	}
+}
+
+/** Parse the original /dag-plan prompt out of a saved plan file. */
+export function extractPromptFromMarkdown(markdown: string): string {
+	const m = markdown.match(/^(- \*\*Prompt:\*\* )(.*)$/m);
+	return m?.[2]?.trim() ?? "";
 }

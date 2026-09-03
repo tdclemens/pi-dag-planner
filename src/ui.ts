@@ -201,6 +201,8 @@ export interface DagPlanDetails {
 	planDurationMs?: number;
 	/** Non-fatal validation warnings (e.g. unordered touches overlap). */
 	warnings?: string[];
+	/** Resume: ids of the steps already completed in a prior run. */
+	resume?: { done: string[] };
 }
 
 export function renderPlanMessage(
@@ -234,13 +236,17 @@ export function renderPlanMessage(
 		details.planDurationMs !== undefined ? ` · planned in ${formatDuration(details.planDurationMs)}` : "";
 	lines.push(theme.fg("dim", `${waves.length} wave${waves.length > 1 ? "s" : ""}${plannedIn}`));
 
+	const resumeDone = new Set(details.resume?.done ?? []);
 	const maxIdLen = Math.max(0, ...plan.steps.map((s) => s.id.length));
 	waves.forEach((wave, i) => {
 		const last = i === waves.length - 1;
 		lines.push(theme.fg("muted", `${last ? "└" : "├"}─ wave ${i + 1}${wave.length > 1 ? " (parallel)" : ""}`));
 		for (const node of wave) {
 			const deps = node.dependsOn.length > 0 ? theme.fg("dim", `  (← ${node.dependsOn.join(", ")})`) : "";
-			lines.push(`  ${theme.fg("muted", "●")} ${theme.fg("toolTitle", node.id.padEnd(maxIdLen))}  ${node.title}${deps}`);
+			const done = resumeDone.has(node.id);
+			const marker = done ? theme.fg("success", "✓") : theme.fg("muted", "●");
+			const doneSuffix = done ? theme.fg("dim", "  (done)") : "";
+			lines.push(`  ${marker} ${theme.fg("toolTitle", node.id.padEnd(maxIdLen))}  ${node.title}${deps}${doneSuffix}`);
 		}
 	});
 
@@ -265,7 +271,13 @@ export function renderPlanMessage(
 		lines.push(theme.fg("mdCodeBlock", JSON.stringify(plan, null, 2)));
 	} else {
 		lines.push("");
-		lines.push(theme.fg("dim", `Plan saved: ${shortenHome(planPath)}   (Ctrl+O: JSON)`));
+		if (details.resume) {
+			const done = details.resume.done.length;
+			const remaining = plan.steps.length - done;
+			lines.push(theme.fg("dim", `Resuming: ${shortenHome(planPath)} — ${done} done, ${remaining} to run   (Ctrl+O: JSON)`));
+		} else {
+			lines.push(theme.fg("dim", `Plan saved: ${shortenHome(planPath)}   (Ctrl+O: JSON)`));
+		}
 	}
 
 	box.addChild(new Text(lines.join("\n"), 0, 0));
@@ -475,7 +487,7 @@ export class RunDashboard implements Component {
 			row.snippet = event.snippet;
 		} else if (event.type === "node-blocked" && event.resource && event.heldBy) {
 			row.blockedBy = { resource: event.resource, heldBy: event.heldBy };
-		} else if (event.type === "node-end" && event.result) {
+		} else if ((event.type === "node-end" || event.type === "node-restored") && event.result) {
 			row.status = event.result.status;
 			row.startedAt = event.result.startedAt ?? row.startedAt;
 			row.finishedAt = event.result.finishedAt ?? Date.now();

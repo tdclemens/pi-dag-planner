@@ -89,6 +89,20 @@ test("update() requests a re-render for every event type", () => {
 	assert.equal(h.renders, 5, "node-blocked");
 });
 
+test("update() treats node-restored like node-end (row done, re-render requested)", () => {
+	const { dashboard, emit } = makeDashboard();
+	emit({
+		type: "node-restored",
+		nodeId: "a",
+		result: result({ id: "a", status: "done", startedAt: 0, finishedAt: 14200, output: "ok" }),
+	});
+	const lines = dashboard.render(W);
+	const row = lines.find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("✓"), row);
+	assert.ok(row.includes("14.2s"), row);
+	assert.ok(lines[0].includes("1/2 done"), lines[0]);
+});
+
 test("pending row shows the file-lock wait while a running node holds the resource", () => {
 	const lockPlan: DagPlan = {
 		goal: "lock goal",
@@ -344,4 +358,21 @@ test("renderPlanMessage shows validation warnings when the plan has them", () =>
 	const msg2 = { content: "x", details: { plan, planPath: "/p" } };
 	const text2 = renderPlanMessage(msg2 as never, { expanded: false, outputPad: 0 }, theme).render(W).join("\n");
 	assert.ok(!text2.includes("⚠"), text2);
+});
+
+test("renderPlanMessage marks already-done steps and shows the resume footer", () => {
+	const msg = {
+		content: "DAG Plan (resume) — test goal (2 steps, 1 done)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md", resume: { done: ["a"] } },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	const rowA = text.split("\n").find((l) => l.includes("Alpha"))!;
+	assert.ok(rowA.includes("✓"), rowA);
+	assert.ok(rowA.includes("(done)"), rowA);
+	const rowB = text.split("\n").find((l) => l.includes("Beta"))!;
+	assert.ok(rowB.includes("●"), rowB);
+	assert.ok(!rowB.includes("(done)"), rowB);
+	assert.ok(text.includes("Resuming: /home/u/.agents/plans/x.md — 1 done, 1 to run"), text);
+	assert.ok(!text.includes("Plan saved:"), text);
 });

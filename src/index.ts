@@ -11,6 +11,9 @@
  *   4. Persist: results appended to the plan file + summary message.
  */
 
+import * as fsp from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
 	BorderedLoader,
 	type ExtensionAPI,
@@ -19,11 +22,11 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { runPlan } from "./executor.ts";
 import { loadConfig, type DagPlanConfig } from "./config.ts";
-import { plan, plannerExplores, PlanError, planWithRetries, type PlanRetryFailure } from "./planner.ts";
+import { normalizePlan, plan, plannerExplores, PlanError, planWithRetries, type PlanRetryFailure } from "./planner.ts";
 import * as plans from "./plans.ts";
 import { validatePlan } from "./dag.ts";
-import type { DagEvent, NodeResult, PlannerResult } from "./types.ts";
-import { addUsage } from "./types.ts";
+import type { DagEvent, DagPlan, NodeResult, PlannerResult, UsageStats } from "./types.ts";
+import { addUsage, emptyUsage } from "./types.ts";
 import {
 	formatDuration,
 	formatUsageStats,
@@ -46,9 +49,15 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	let activeRun: { abort: () => void } | undefined;
 
 	pi.registerCommand("dag-plan", {
-		description: "Plan a DAG of subagent steps, then execute them in parallel",
+		description:
+			"Plan a DAG of subagent steps, then execute them in parallel (resume <plan-file>: continue an interrupted run)",
 		handler: async (args, ctx) => {
 			try {
+				const resumeMatch = args.trim().match(/^resume\s+(\S+)/);
+				if (resumeMatch) {
+					await runResumeFlow(resumeMatch[1], ctx);
+					return;
+				}
 				await runDagPlanFlow(args, ctx);
 			} catch (e) {
 				ctx.ui.notify(`dag-plan error: ${e instanceof Error ? e.message : String(e)}`, "error");
@@ -151,15 +160,60 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		}
 
 		// ------------------------------------------------------------------
-		// Phase 3: execute with the live dashboard
+		// Phases 3+4: execute with the live dashboard, persist, summarize
 		// ------------------------------------------------------------------
-		const { plan: dag, planPath, plannerUsage } = gate;
+		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+	}
+
+	/**
+	 * Phases 3+4 (shared by the fresh-run flow and /dag-plan resume):
+	 * execute the plan with the live dashboard, persist results (plan file +
+	 * run-state sidecar), and send the summary message.
+	 */
+	async function executePlan(
+		ctx: ExtensionCommandContext,
+		modelLabel: string,
+		config: DagPlanConfig,
+		originalPrompt: string,
+		dag: DagPlan,
+		planPath: string,
+		plannerUsage: UsageStats,
+		planDurationMs: number | undefined,
+		initialResults: Record<string, NodeResult>,
+		isResume: boolean,
+	): Promise<void> {
 		const controller = new AbortController();
 		activeRun = { abort: () => controller.abort() };
 		const runStartedAt = Date.now();
 		const totalSteps = dag.steps.length;
 		let finishedCount = 0;
 		let failedCount = 0;
+
+		// Run-state sidecar (<plan>.run.json): written at start, on every
+		// node-end, and at the end, so an interrupted run can be resumed from
+		// the last completed node. Mid-run writes are fire-and-forget (a lost
+		// write only costs a re-run of that node); the final write is awaited
+		// because resume relies on it.
+		const runState: plans.RunStateFile = {
+			version: 1,
+			planPath,
+			plan: dag,
+			prompt: originalPrompt,
+			status: "executing",
+			startedAt: runStartedAt,
+			updatedAt: runStartedAt,
+			results: Object.fromEntries(Object.entries(initialResults).filter(([, r]) => r.status === "done")),
+		};
+		const persistState = (result?: NodeResult, finalStatus?: plans.PlanFileStatus): Promise<void> => {
+			if (result) runState.results[result.id] = result;
+			if (finalStatus) runState.status = finalStatus;
+			runState.updatedAt = Date.now();
+			return plans.saveRunState(runState);
+		};
+		void persistState().catch(() => {
+			ctx.ui.notify("dag-plan: could not write run state — resume will restart from the last saved node", "warning");
+		});
+		void plans.setPlanFileStatus(planPath, "executing").catch(() => {});
 
 		ctx.ui.setStatus(STATUS_KEY, `0/${totalSteps} running…`);
 
@@ -170,16 +224,18 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				model: modelLabel,
 				thinkingLevel: ctx.thinkingLevel,
 				config,
-				originalPrompt: prompt,
+				originalPrompt,
 				signal: controller.signal,
+				initialResults,
 				onEvent: (e: DagEvent) => {
-					if (e.type === "node-end") {
+					if (e.type === "node-end" || e.type === "node-restored") {
 						finishedCount++;
 						if (e.result.status === "failed" || e.result.status === "aborted") failedCount++;
 					}
 					dashboard.update(e);
 					if (e.type === "node-end") {
 						pi.appendEntry(NODE_ENTRY_TYPE, { ...e.result });
+						void persistState(e.result).catch(() => {});
 						ctx.ui.setStatus(STATUS_KEY, `${finishedCount}/${totalSteps}${failedCount > 0 ? " (failures)" : ""}`);
 					}
 				},
@@ -200,17 +256,23 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("dag-plan run aborted before completion.", "info");
 			return;
 		}
-		if (signal.aborted) return;
+		if (ctx.signal?.aborted) return;
 
 		// ------------------------------------------------------------------
-		// Phase 4: persist results + summary
+		// Persist results + summary
 		// ------------------------------------------------------------------
 		const durationMs = Date.now() - runStartedAt;
 		const succeeded = results.filter((r) => r.status === "done").length;
 		const failed = results.filter((r) => r.status === "failed").length;
 		const skipped = results.filter((r) => r.status === "skipped").length;
 		const wasAborted = controller.signal.aborted;
-		const status = wasAborted ? "aborted" : failed > 0 ? "completed-with-failures" : "completed";
+		const status: plans.PlanFileStatus = wasAborted ? "aborted" : failed > 0 ? "completed-with-failures" : "completed";
+
+		try {
+			await persistState(undefined, status);
+		} catch (e) {
+			ctx.ui.notify(`Warning: could not persist run state: ${e instanceof Error ? e.message : String(e)}`, "warning");
+		}
 
 		let totalUsage = plannerUsage;
 		for (const r of results) totalUsage = addUsage(totalUsage, r.usage);
@@ -221,13 +283,14 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`Warning: could not persist results: ${e instanceof Error ? e.message : String(e)}`, "warning");
 		}
 
+		const resumeTag = isResume ? " (resume)" : "";
 		const lines: string[] = [];
 		lines.push(
 			wasAborted
-				? `DAG run aborted — ${succeeded}/${totalSteps} steps completed.`
+				? `DAG run${resumeTag} aborted — ${succeeded}/${totalSteps} steps completed.`
 				: failed > 0
-					? `DAG run finished with ${failed} failure${failed > 1 ? "s" : ""} — ${succeeded}/${totalSteps} completed, ${skipped} skipped.`
-					: `DAG run completed — all ${totalSteps} steps succeeded.`,
+					? `DAG run${resumeTag} finished with ${failed} failure${failed > 1 ? "s" : ""} — ${succeeded}/${totalSteps} completed, ${skipped} skipped.`
+					: `DAG run${resumeTag} completed — all ${totalSteps} steps succeeded.`,
 		);
 		for (const r of results) {
 			const dur =
@@ -242,9 +305,13 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			}
 		}
 		lines.push("");
+		const plannedIn = planDurationMs !== undefined ? ` (planned in ${formatDuration(planDurationMs)})` : "";
 		lines.push(
-			`Totals: ${formatDuration(durationMs)} · ${formatUsageStats(totalUsage)} · plan: ${shortenHome(planPath)} (planned in ${formatDuration(gate.planDurationMs)})`,
+			`Totals: ${formatDuration(durationMs)} · ${formatUsageStats(totalUsage)} · plan: ${shortenHome(planPath)}${plannedIn}`,
 		);
+		if (wasAborted || failed > 0) {
+			lines.push(`Resume: /dag-plan resume ${shortenHome(planPath)}`);
+		}
 
 		pi.sendMessage({
 			customType: SUMMARY_MESSAGE_TYPE,
@@ -257,7 +324,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				failed,
 				skipped,
 				durationMs,
-				planDurationMs: gate.planDurationMs,
+				planDurationMs,
 				usage: totalUsage,
 				// Full per-node reports for the renderer's expanded view (Ctrl+O).
 				// details never reach the LLM; snippets stay in the per-node
@@ -265,6 +332,97 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				results: results.map((r) => ({ ...r, snippets: [] })),
 			},
 		});
+	}
+
+	/**
+	 * /dag-plan resume <plan-file> — continue an interrupted (or failed)
+	 * run: load the plan + prior results from the run-state sidecar (falling
+	 * back to the plan file's embedded JSON), restore completed nodes, and
+	 * execute the rest.
+	 */
+	async function runResumeFlow(planPathArg: string, ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify("/dag-plan requires the interactive TUI.", "error");
+			return;
+		}
+		const model = ctx.model;
+		if (!model) {
+			ctx.ui.notify("No model selected (use /model).", "error");
+			return;
+		}
+		const modelLabel = `${model.provider}/${model.id}`;
+		const { config, warnings: configWarnings } = loadConfig(ctx.isProjectTrusted() ? ctx.cwd : undefined);
+		for (const w of configWarnings) ctx.ui.notify(`dag-plan config: ${w}`, "warning");
+
+		const planPath = resolvePlanPath(planPathArg, ctx.cwd);
+		if (!planPath) {
+			ctx.ui.notify(`Could not resolve plan file path: ${planPathArg}`, "error");
+			return;
+		}
+		let markdown = "";
+		try {
+			markdown = await fsp.readFile(planPath, "utf8");
+		} catch {
+			/* plan file missing — the sidecar alone can still support a resume */
+		}
+
+		// Prefer the run-state sidecar (plan + per-node results); fall back
+		// to the plan file's embedded JSON (fresh start, no prior results).
+		const state = await plans.loadRunState(planPath);
+		let plan: DagPlan | null = state ? normalizePlan(state.plan) : null;
+		const priorResults: Record<string, NodeResult> = state?.results ?? {};
+		if (!plan) plan = plans.extractPlanFromMarkdown(markdown);
+		if (!plan) {
+			ctx.ui.notify("No valid plan JSON found (expected a saved /dag-plan plan file or its .run.json sidecar).", "error");
+			return;
+		}
+		const originalPrompt =
+			typeof state?.prompt === "string" && state.prompt ? state.prompt : plans.extractPromptFromMarkdown(markdown);
+
+		const v = validatePlan(plan, config);
+		if (!v.ok) {
+			ctx.ui.notify(`Plan in ${shortenHome(planPath)} is invalid: ${v.error}`, "error");
+			return;
+		}
+
+		// Restore only completed nodes; failed/skipped/aborted are re-run.
+		const initialResults: Record<string, NodeResult> = {};
+		for (const s of plan.steps) {
+			const r = priorResults[s.id];
+			if (r && r.status === "done" && typeof r.output === "string") initialResults[s.id] = r;
+		}
+		const doneCount = Object.keys(initialResults).length;
+		const remaining = plan.steps.length - doneCount;
+		if (remaining === 0) {
+			ctx.ui.notify("All steps are already done — nothing to resume.", "info");
+			return;
+		}
+
+		pi.sendMessage({
+			customType: PLAN_MESSAGE_TYPE,
+			content: `DAG Plan (resume) — ${plan.goal} (${plan.steps.length} steps, ${doneCount} done)`,
+			display: true,
+			details: { plan, planPath, warnings: v.warnings, resume: { done: Object.keys(initialResults) } },
+		});
+
+		const choice = await ctx.ui.select(
+			`Resume plan — ${remaining} step${remaining > 1 ? "s" : ""} to run (${doneCount} already done)?`,
+			["Execute resume", "Cancel"],
+		);
+		if (choice !== "Execute resume") {
+			if (choice !== undefined) ctx.ui.notify("Resume cancelled.", "info");
+			return;
+		}
+
+		await executePlan(ctx, modelLabel, config, originalPrompt, plan, planPath, emptyUsage(), undefined, initialResults, true);
+	}
+
+	/** Resolve a user-supplied plan file path (~ or cwd-relative) to absolute. */
+	function resolvePlanPath(arg: string, cwd: string): string | null {
+		const p = arg.trim().replace(/^["']|["']$/g, "");
+		if (!p) return null;
+		if (p.startsWith("~/")) return path.resolve(os.homedir(), p.slice(2));
+		return path.resolve(cwd, p);
 	}
 
 	/**

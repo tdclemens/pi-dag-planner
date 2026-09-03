@@ -43,7 +43,7 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
    ○ s4  Run tests and fix failures (waiting: s3)
    ```
 
-   When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. **Esc** cancels the run (children are terminated, state is finalized).
+   When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. Each node's result is also checkpointed to the run-state sidecar (`<plan>.run.json`) as it completes, so an interrupted run can be resumed (see [Resume](#resume)). **Esc** cancels the run (children are terminated, state is finalized).
 
    Node status icons (single-cell, non-emoji, so the column aligns in any terminal): `○` pending · `▶` running · `✓` done · `✗` failed · `⊘` skipped · `■` aborted. Usage lines show `↑` input tokens, `↓` output tokens, `R`/`W` cache read/write, then cost and model. A pending node waiting on the file lock shows why: `○ s4  Run tests (file lock: package-lock.json held by s1)`.
 
@@ -135,6 +135,19 @@ Examples:
 Totals: 4/4 succeeded · $0.0712 · 2m03s
 ````
 
+### Resume
+
+Every run also writes a run-state sidecar next to the plan file (`<plan>.run.json`) — the plan, the original prompt, and each node's result as it completes (atomic writes, so a crash never leaves a torn file). If a run is interrupted (Esc, crash, closed laptop) or finishes with failures, continue it from where it left off:
+
+```
+/dag-plan resume ~/.agents/plans/20250101-120000-add-unit-tests.md
+```
+
+- **Completed (✓ done) nodes are restored** — they are not re-run, and their outputs are still injected into their dependents' prompts.
+- **Failed, skipped, and aborted nodes are re-run**, along with anything that was still pending.
+- Works on plan files that were never executed (the embedded JSON is used as a fresh start) and on plan files saved before the sidecar existed.
+- The post-run summary shows the exact resume command whenever there is anything left to do.
+
 ## Configuration
 
 All options live in a JSON config file in the usual pi extension locations —
@@ -224,7 +237,7 @@ src/
 ├── dag.ts       # pure DAG utils: schema + graph validation (cycles, deps), topo levels
 ├── executor.ts  # ready-set scheduler + pi subprocess subagents + JSONL parsing
 ├── ui.ts        # plan renderer, node result cards, live runner dashboard, snippets
-├── plans.ts     # ~/.agents/plans/ markdown writer (plan + results append)
+├── plans.ts     # ~/.agents/plans/ markdown writer (plan + results append + run-state sidecar)
 └── types.ts     # shared types
 ```
 
@@ -248,5 +261,5 @@ pi -e ./src/index.ts
 - Execution is interactive only; non-TUI modes refuse the command.
 - A failed node skips its dependents; the rest of the graph continues. (Interactive retry of a failed node is planned.)
 - Subagent sessions are ephemeral (`--no-session`); the transcript cards, results table, and plan file are the durable record, with large outputs truncated.
-- No resume of an interrupted run — re-plan with `/dag-plan` if you need to continue.
+- Resume re-runs failed/skipped/aborted nodes from scratch; a node that was still running when the run was interrupted is re-run in full (its partial work is not rolled back).
 - The file lock covers the `read`/`write`/`edit` tools only; `bash`-mediated file mutations are not intercepted (see [Concurrent file conflicts](#concurrent-file-conflicts)).

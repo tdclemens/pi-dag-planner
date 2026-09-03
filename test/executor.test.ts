@@ -5,6 +5,7 @@ import type { ChildProcess } from "node:child_process";
 import { buildTaskPrompt, getMaxParallel, runPiSubagent, runPlan } from "../src/executor.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult } from "../src/types.ts";
+import { emptyUsage } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
 // Fake subprocess
@@ -714,4 +715,102 @@ test("runPlan honors config maxParallel as the concurrency bound", async () => {
 		config: { ...DEFAULT_CONFIG, maxParallel: 2 },
 	});
 	assert.equal(h.maxActive, 2);
+});
+
+// --- resume (initialResults) -------------------------------------------------
+
+function doneResult(id: string, output: string): NodeResult {
+	return {
+		id,
+		title: `Title ${id}`,
+		status: "done",
+		startedAt: 0,
+		finishedAt: 1000,
+		snippets: [{ toolName: "bash", args: { command: "true" } }],
+		output,
+		usage: emptyUsage(),
+	};
+}
+
+test("runPlan resume: restores done nodes, runs the rest, injects restored outputs", async () => {
+	const plan: DagPlan = {
+		goal: "g",
+		steps: [
+			node("s1"),
+			node("s2"),
+			{ ...node("s3"), dependsOn: ["s1", "s2"] },
+			{ ...node("s4"), dependsOn: ["s3"] },
+		],
+	};
+	const h = makeHarness({
+		program: (record) => record.proc.emitSuccess(`report from ${record.env?.DAG_NODE_ID ?? "?"}`),
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+		initialResults: { s1: doneResult("s1", "report from s1"), s2: doneResult("s2", "report from s2") },
+	});
+
+	assert.deepEqual(results.map((r) => r.id), ["s1", "s2", "s3", "s4"]);
+	assert.ok(results.every((r) => r.status === "done"), results.map((r) => r.status).join(","));
+	// Only the not-yet-done nodes spawn.
+	assert.equal(h.spawns.length, 2);
+	assert.deepEqual(h.spawns.map((r) => r.env?.DAG_NODE_ID), ["s3", "s4"]);
+	// Restored nodes emit node-restored (not node-start / node-end).
+	assert.deepEqual(
+		events.filter((e) => e.type === "node-restored").map((e) => (e as { nodeId: string }).nodeId),
+		["s1", "s2"],
+	);
+	assert.equal(events.filter((e) => e.type === "node-start").length, 2);
+	assert.equal(events.filter((e) => e.type === "node-end").length, 2);
+	// s3's task prompt carries the restored dep outputs.
+	const s3Prompt = h.spawns[0]!.args[h.spawns[0]!.args.length - 1]!;
+	assert.ok(s3Prompt.includes("report from s1"), s3Prompt);
+	assert.ok(s3Prompt.includes("report from s2"), s3Prompt);
+});
+
+test("runPlan resume: failed/skipped prior results are re-run, not restored", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), { ...node("s2"), dependsOn: ["s1"] }] };
+	const h = makeHarness();
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+		initialResults: {
+			s1: { ...doneResult("s1", "x"), status: "failed", error: "boom" },
+			s2: { ...doneResult("s2", "x"), status: "skipped", skipReason: "dependency s1 failed" },
+		},
+	});
+	assert.equal(h.spawns.length, 2, "both nodes re-run");
+	assert.deepEqual(h.spawns.map((r) => r.env?.DAG_NODE_ID), ["s1", "s2"]);
+	assert.equal(events.filter((e) => e.type === "node-restored").length, 0);
+	assert.ok(results.every((r) => r.status === "done"), results.map((r) => r.status).join(","));
+});
+
+test("runPlan resume: unknown prior ids are ignored; all-done plan spawns nothing", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2")] };
+	const h = makeHarness();
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+		initialResults: {
+			s1: doneResult("s1", "one"),
+			s2: doneResult("s2", "two"),
+			ghost: doneResult("ghost", "nope"),
+		},
+	});
+	assert.equal(h.spawns.length, 0);
+	assert.ok(results.every((r) => r.status === "done"));
+	assert.deepEqual(
+		events.filter((e) => e.type === "node-restored").map((e) => (e as { nodeId: string }).nodeId),
+		["s1", "s2"],
+	);
 });

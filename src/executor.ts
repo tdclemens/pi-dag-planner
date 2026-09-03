@@ -112,6 +112,13 @@ export interface RunPlanOptions {
 	 * prompt so subagents see the full request, not just the one-line goal.
 	 */
 	originalPrompt?: string;
+	/**
+	 * Resume support: per-node results from a prior (interrupted) run of this
+	 * plan. Entries with status "done" are restored — the node is marked done
+	 * up front (its dependents start immediately and see its output); every
+	 * other status is re-run. Unknown ids are ignored.
+	 */
+	initialResults?: Record<string, NodeResult>;
 	signal: AbortSignal;
 	onEvent?: (event: DagEvent) => void;
 	/** Test seam: replace the subprocess spawn. */
@@ -149,6 +156,20 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 	// nodeId -> last node-blocked info emitted, so the UI event fires only
 	// when the blocking resource/holder changes, not every scheduler tick.
 	const blockedInfo = new Map<string, { resource: string; heldBy: string }>();
+
+	// Resume: restore nodes that already completed in a prior run. Only
+	// "done" results are honored (failed/aborted/skipped nodes are re-run);
+	// ids that no longer exist in the plan are ignored. Restored nodes emit
+	// node-restored (not node-end) so the host does not append duplicate
+	// transcript entries for them.
+	for (const step of steps) {
+		const prior = opts.initialResults?.[step.id];
+		if (!prior || prior.status !== "done" || typeof prior.output !== "string") continue;
+		results.set(step.id, prior);
+		status.set(step.id, "done");
+		doneIds.add(step.id);
+		onEvent({ type: "node-restored", nodeId: step.id, result: prior });
+	}
 
 	function emitEnd(nodeId: string, result: NodeResult): void {
 		results.set(nodeId, result);

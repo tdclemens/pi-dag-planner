@@ -276,6 +276,91 @@ test("runPlan: model error stopReason counts as failure", async () => {
 	assert.match(results[0]!.error!, /rate limited/);
 });
 
+// --- completion guards: a node that did no work is not "done" -----------------
+
+test("runPlan fails a node whose final message was truncated (stopReason length)", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("kid", ["s1"])] };
+	const h = makeHarness({
+		program: (record) => {
+			// One text-only message, cut off at the output-token limit, exit 0.
+			record.proc.stdout.emit(
+				"data",
+				Buffer.from(
+					JSON.stringify({
+						type: "message_end",
+						message: {
+							role: "assistant",
+							stopReason: "length",
+							model: "test/model",
+							content: [{ type: "text", text: "Let me plan the structure: first the engine, then the sam" }],
+							usage: { input: 3000, output: 16000, cacheRead: 0, cacheWrite: 0, totalTokens: 19000, cost: { total: 0.01 } },
+						},
+					}) + "\n",
+				),
+			);
+			setImmediate(() => record.proc.emit("close", 0));
+		},
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	const byId = new Map(results.map((r) => [r.id, r]));
+	assert.equal(byId.get("s1")!.status, "failed");
+	assert.equal(byId.get("s1")!.stopReason, "length");
+	assert.match(byId.get("s1")!.error!, /truncated/);
+	// Dependents of a truncated node are skipped, not run against a phantom report.
+	assert.equal(byId.get("kid")!.status, "skipped");
+	assert.equal(h.spawns.length, 1);
+});
+
+test("runPlan fails a node that ended without any tool calls", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => {
+			// A clean stop (not truncated), but the model only talked — no work.
+			record.proc.stdout.emit(
+				"data",
+				Buffer.from(
+					JSON.stringify({
+						type: "message_end",
+						message: {
+							role: "assistant",
+							stopReason: "stop",
+							model: "test/model",
+							content: [{ type: "text", text: "I will now build the engine. Let me plan the structure..." }],
+							usage: { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 140, cost: { total: 0.001 } },
+						},
+					}) + "\n",
+				),
+			);
+			setImmediate(() => record.proc.emit("close", 0));
+		},
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(results[0]!.status, "failed");
+	assert.match(results[0]!.error!, /no tool calls/);
+});
+
+test("runPlan still marks a node done when it made tool calls and stopped cleanly", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => record.proc.emitSuccess("Built the engine. Artifacts: engine/"),
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(results[0]!.status, "done");
+	assert.equal(results[0]!.snippets.length, 1);
+});
+
 test("runPlan aborts in-flight nodes and marks pending ones aborted", async () => {
 	const plan: DagPlan = { goal: "g", steps: [node("slow"), node("never")] };
 	const controller = new AbortController();
@@ -323,7 +408,18 @@ test("runPlan accumulates usage across turns", async () => {
 						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { total: 0.001 } },
 					},
 				});
-			record.proc.stdout.emit("data", Buffer.from(msg("first") + "\n" + msg("second") + "\n"));
+			// Turn 1 ends with a tool call (toolUse), turn 2 is the final report.
+			record.proc.stdout.emit(
+				"data",
+				Buffer.from(
+					msg("first") +
+					"\n" +
+					JSON.stringify({ type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: { command: "true" } }) +
+					"\n" +
+					msg("second") +
+					"\n",
+				),
+			);
 			setImmediate(() => record.proc.emit("close", 0));
 		},
 	});

@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	buildPlannerArgs,
 	blindPlannerPrompt,
 	extractPlanJson,
+	loadPlannerInstructions,
 	normalizePlan,
 	PlanError,
 	plannerExplores,
@@ -13,6 +17,8 @@ import {
 	planWithRetries,
 	plannerSystemPrompt,
 	PLANNER_MAX_ATTEMPTS,
+	MAX_PLAN_MD_CHARS,
+	PLANNER_INSTRUCTIONS_FILE,
 } from "../src/planner.ts";
 import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -508,6 +514,170 @@ test("plan() blind path attaches the raw output and honors the truncation hint",
 	);
 	assert.ok(capturedText!.includes(truncatedPlanText), "prior output included in the prompt");
 	assert.match(capturedText!, /more concise plan/i, "truncation hint included");
+});
+
+// ---------------------------------------------------------------------------
+// PLAN.md: project-specific planning instructions (planner-only injection)
+// ---------------------------------------------------------------------------
+
+/** A temp project root (mkdtemp) for PLAN.md injection tests. */
+function tempCwd(): { dir: string; cleanup: () => void } {
+	const dir = mkdtempSync(join(tmpdir(), "dag-planner-planmd-"));
+	return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("loadPlannerInstructions returns the trimmed PLAN.md content", async () => {
+	const { dir, cleanup } = tempCwd();
+	try {
+		writeFileSync(join(dir, PLANNER_INSTRUCTIONS_FILE), "\n  use tabs and run npm test\n\n");
+		assert.equal(await loadPlannerInstructions(dir), "use tabs and run npm test");
+	} finally {
+		cleanup();
+	}
+});
+
+test("loadPlannerInstructions returns undefined for missing cwd/dir/file or whitespace-only content", async () => {
+	assert.equal(await loadPlannerInstructions(), undefined, "no cwd");
+	assert.equal(await loadPlannerInstructions("/nonexistent-dag-planner-root-123"), undefined, "missing dir");
+	const { dir, cleanup } = tempCwd();
+	try {
+		assert.equal(await loadPlannerInstructions(dir), undefined, "dir without PLAN.md");
+		writeFileSync(join(dir, PLANNER_INSTRUCTIONS_FILE), "   \n\t  \n");
+		assert.equal(await loadPlannerInstructions(dir), undefined, "whitespace-only PLAN.md");
+	} finally {
+		cleanup();
+	}
+});
+
+test("loadPlannerInstructions truncates PLAN.md above MAX_PLAN_MD_CHARS with the marker", async () => {
+	const { dir, cleanup } = tempCwd();
+	try {
+		const marker = "…(PLAN.md truncated)";
+		writeFileSync(
+			join(dir, PLANNER_INSTRUCTIONS_FILE),
+			"H".repeat(1000) + "M".repeat(MAX_PLAN_MD_CHARS + 5000) + "T".repeat(1000),
+		);
+		const result = (await loadPlannerInstructions(dir))!;
+		assert.ok(result.startsWith("H".repeat(1000)), "head kept");
+		assert.ok(result.endsWith(marker), "truncation marker appended");
+		assert.equal(result.length, MAX_PLAN_MD_CHARS + marker.length);
+		assert.ok(!result.includes("T".repeat(100)), "tail elided");
+	} finally {
+		cleanup();
+	}
+});
+
+test("planner prompts state that PLAN.md is authoritative project guidance", () => {
+	for (const prompt of [plannerSystemPrompt(12), blindPlannerPrompt(12)]) {
+		assert.match(prompt, /PLAN\.md/);
+		assert.match(prompt, /'Project planning instructions'/);
+		assert.match(prompt, /authoritative project guidance/);
+	}
+});
+
+test("plan() injects PLAN.md into the exploring planner prompt before the task when present", async () => {
+	const { dir, cleanup } = tempCwd();
+	try {
+		const planMd = "Use pnpm, not npm; always run pnpm test before reporting done.";
+		writeFileSync(join(dir, PLANNER_INSTRUCTIONS_FILE), planMd);
+		const ctx: any = { ...fakeCtx(), cwd: dir };
+		const result = await plan(ctx, "Add tests", {
+			spawnImpl: (_command, args, cwd) => {
+				assert.equal(cwd, dir);
+				const prompt = args[args.length - 1];
+				assert.ok(prompt.startsWith("Project planning instructions (from PLAN.md):"), "instructions come first");
+				assert.ok(prompt.includes(planMd), "PLAN.md content present");
+				assert.match(prompt, /planning-only instructions/i, "note about planner-only visibility");
+				assert.ok(
+					prompt.indexOf("Project planning instructions") < prompt.indexOf("Plan this task:"),
+					"instructions precede the task",
+				);
+				return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+			},
+		});
+		assert.ok(result);
+		assert.equal(result!.plan.steps.length, 2);
+	} finally {
+		cleanup();
+	}
+});
+
+test("plan() omits the instructions part from the exploring prompt when PLAN.md is absent", async () => {
+	const { dir, cleanup } = tempCwd();
+	try {
+		const ctx: any = { ...fakeCtx(), cwd: dir };
+		const result = await plan(ctx, "x", {
+			spawnImpl: (_command, args) => {
+				const prompt = args[args.length - 1];
+				assert.ok(!prompt.includes("Project planning instructions"), "no instructions part without PLAN.md");
+				assert.ok(prompt.startsWith("Plan this task:"), "prompt starts with the task");
+				return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+			},
+		});
+		assert.ok(result);
+	} finally {
+		cleanup();
+	}
+});
+
+test("plan() blind path includes the PLAN.md instructions in the user message", async () => {
+	const { dir, cleanup } = tempCwd();
+	let capturedText: string | undefined;
+	try {
+		const planMd = "Prefer vitest over jest for new tests.";
+		writeFileSync(join(dir, PLANNER_INSTRUCTIONS_FILE), planMd);
+		const ctx: any = {
+			...fakeCtx(),
+			cwd: dir,
+			modelRegistry: {
+				complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
+					capturedText = req.messages[0].content[0].text;
+					return {
+						stopReason: "stop",
+						content: [{ type: "text", text: validPlanJson }],
+						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+					};
+				},
+			},
+		};
+		const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+		assert.ok(result);
+		assert.match(capturedText!, /Project planning instructions \(from PLAN\.md\):/);
+		assert.ok(capturedText!.includes(planMd));
+		assert.ok(
+			capturedText!.indexOf("Project planning instructions") < capturedText!.indexOf("Plan this task:"),
+			"instructions precede the task",
+		);
+	} finally {
+		cleanup();
+	}
+});
+
+test("plan() blind path omits the instructions part when PLAN.md is absent", async () => {
+	const { dir, cleanup } = tempCwd();
+	let capturedText: string | undefined;
+	try {
+		const ctx: any = {
+			...fakeCtx(),
+			cwd: dir,
+			modelRegistry: {
+				complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
+					capturedText = req.messages[0].content[0].text;
+					return {
+						stopReason: "stop",
+						content: [{ type: "text", text: validPlanJson }],
+						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
+					};
+				},
+			},
+		};
+		const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+		assert.ok(result);
+		assert.ok(!capturedText!.includes("Project planning instructions"));
+		assert.ok(capturedText!.startsWith("Plan this task:"));
+	} finally {
+		cleanup();
+	}
 });
 
 test("plan() caps very large prior output, keeping the tail", async () => {

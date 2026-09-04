@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
-import { buildTaskPrompt, getMaxParallel, runPiSubagent, runPlan } from "../src/executor.ts";
+import { buildTaskPrompt, getMaxParallel, getMaxRetries, parseStatusLine, runPiSubagent, runPlan } from "../src/executor.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
@@ -229,6 +229,7 @@ test("runPlan marks dependents of a failed node as skipped (transitively)", asyn
 	const results = await runPlan(plan, {
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
+		config: { ...DEFAULT_CONFIG, nodeRetries: 0 },
 		spawnImpl: h.spawnImpl,
 		onEvent,
 	});
@@ -271,6 +272,7 @@ test("runPlan: model error stopReason counts as failure", async () => {
 	const results = await runPlan(plan, {
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
+		config: { ...DEFAULT_CONFIG, nodeRetries: 0 },
 		spawnImpl: h.spawnImpl,
 	});
 	assert.equal(results[0]!.status, "failed");
@@ -305,6 +307,7 @@ test("runPlan fails a node whose final message was truncated (stopReason length)
 	const results = await runPlan(plan, {
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
+		config: { ...DEFAULT_CONFIG, nodeRetries: 0 },
 		spawnImpl: h.spawnImpl,
 	});
 	const byId = new Map(results.map((r) => [r.id, r]));
@@ -342,6 +345,7 @@ test("runPlan fails a node that ended without any tool calls", async () => {
 	const results = await runPlan(plan, {
 		cwd: process.cwd(),
 		signal: new AbortController().signal,
+		config: { ...DEFAULT_CONFIG, nodeRetries: 0 },
 		spawnImpl: h.spawnImpl,
 	});
 	assert.equal(results[0]!.status, "failed");
@@ -360,6 +364,213 @@ test("runPlan still marks a node done when it made tool calls and stopped cleanl
 	});
 	assert.equal(results[0]!.status, "done");
 	assert.equal(results[0]!.snippets.length, 1);
+});
+
+// --- auto-retry of transient failures ----------------------------------------
+
+test("getMaxRetries reads the config cap (default 1)", () => {
+	assert.equal(getMaxRetries(), 1);
+	assert.equal(getMaxRetries({ ...DEFAULT_CONFIG, nodeRetries: 0 }), 0);
+	assert.equal(getMaxRetries({ ...DEFAULT_CONFIG, nodeRetries: 3 }), 3);
+	assert.equal(getMaxRetries({ ...DEFAULT_CONFIG, nodeRetries: -1 }), 1);
+	assert.equal(getMaxRetries({ ...DEFAULT_CONFIG, nodeRetries: 1.5 }), 1);
+});
+
+test("runPlan retries a transient failure once and succeeds on the retry", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record, index) => {
+			if (index === 0) record.proc.emitFailure(1, "boom: crashed");
+			else record.proc.emitSuccess("recovered");
+		},
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.equal(results.length, 1);
+	assert.equal(results[0]!.status, "done");
+	assert.equal(results[0]!.retries, 1);
+	assert.equal(h.spawns.length, 2);
+	const retry = events.find((e) => e.type === "node-retry");
+	assert.ok(retry && retry.type === "node-retry");
+	assert.equal(retry.nodeId, "s1");
+	assert.equal(retry.attempt, 1);
+	assert.equal(retry.maxAttempts, 1);
+	assert.match(retry.reason, /boom: crashed/);
+	// Usage accumulates across attempts (the failed attempt sent no usage).
+	assert.equal(results[0]!.usage.input, 100);
+	// The retry prompt carries the previous failure reason.
+	const secondPrompt = h.spawns[1]!.args[h.spawns[1]!.args.length - 1]!;
+	assert.match(secondPrompt, /A previous attempt at this step failed/);
+	assert.match(secondPrompt, /boom: crashed/);
+	assert.match(secondPrompt, /Inspect the current state first/);
+});
+
+test("runPlan gives up after the retry cap and skips dependents", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("kid", ["s1"])] };
+	const h = makeHarness({
+		program: (record) => record.proc.emitFailure(3, "still broken"),
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	const byId = new Map(results.map((r) => [r.id, r]));
+	assert.equal(byId.get("s1")!.status, "failed");
+	assert.equal(byId.get("s1")!.failureKind, "transient");
+	assert.equal(byId.get("s1")!.retries, 1);
+	assert.equal(h.spawns.length, 2); // initial attempt + 1 retry
+	assert.equal(byId.get("kid")!.status, "skipped");
+	assert.equal(events.filter((e) => e.type === "node-retry").length, 1);
+});
+
+test("runPlan honors nodeRetries: 0 (no auto-retry)", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => record.proc.emitFailure(1, "crash"),
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		config: { ...DEFAULT_CONFIG, nodeRetries: 0 },
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.equal(results[0]!.status, "failed");
+	assert.equal(h.spawns.length, 1);
+	assert.ok(results[0]!.retries === undefined || results[0]!.retries === 0);
+	assert.equal(events.filter((e) => e.type === "node-retry").length, 0);
+});
+
+test("runPlan does not auto-retry a task failure (agent reported STATUS: failure)", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) =>
+			record.proc.emitSuccess("Ran the tests; three are still red.\nSTATUS: failure — tests still red"),
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.equal(results[0]!.status, "failed");
+	assert.equal(results[0]!.failureKind, "task");
+	assert.match(results[0]!.error!, /tests still red/);
+	assert.equal(h.spawns.length, 1);
+	assert.equal(events.filter((e) => e.type === "node-retry").length, 0);
+});
+
+test("runPlan marks a node done on an explicit STATUS: success", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => record.proc.emitSuccess("All done.\nSTATUS: success"),
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(results[0]!.status, "done");
+});
+
+test("runPlan retries a truncated final message (stopReason length)", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record, index) => {
+			if (index === 0) {
+				record.proc.stdout.emit(
+					"data",
+					Buffer.from(
+						JSON.stringify({
+							type: "message_end",
+							message: {
+								role: "assistant",
+								stopReason: "length",
+								model: "test/model",
+								content: [{ type: "text", text: "Let me plan the structure: first the engine, then the sam" }],
+								usage: { input: 3000, output: 16000, cacheRead: 0, cacheWrite: 0, totalTokens: 19000, cost: { total: 0.01 } },
+							},
+						}) + "\n",
+					),
+				);
+				setImmediate(() => record.proc.emit("close", 0));
+			} else {
+				record.proc.emitSuccess("finished this time");
+			}
+		},
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(results[0]!.status, "done");
+	assert.equal(results[0]!.retries, 1);
+	assert.equal(h.spawns.length, 2);
+});
+
+test("runPlan retries an empty (no-tool-call) response", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record, index) => {
+			if (index === 0) {
+				record.proc.stdout.emit(
+					"data",
+					Buffer.from(
+						JSON.stringify({
+							type: "message_end",
+							message: {
+								role: "assistant",
+								stopReason: "stop",
+								model: "test/model",
+								content: [{ type: "text", text: "I will now build the engine." }],
+								usage: { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 140, cost: { total: 0.001 } },
+							},
+						}) + "\n",
+					),
+				);
+				setImmediate(() => record.proc.emit("close", 0));
+			} else {
+				record.proc.emitSuccess("did the work");
+			}
+		},
+	});
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+	});
+	assert.equal(results[0]!.status, "done");
+	assert.equal(results[0]!.retries, 1);
+});
+
+test("parseStatusLine handles the status contract", () => {
+	assert.equal(parseStatusLine(""), null);
+	assert.equal(parseStatusLine("no status line here"), null);
+	assert.equal(parseStatusLine("STATUS: failures observed"), null);
+	assert.deepEqual(parseStatusLine("report\nSTATUS: success"), { kind: "success", reason: "" });
+	assert.deepEqual(parseStatusLine("report\nSTATUS: failure — tests still red"), {
+		kind: "failure",
+		reason: "tests still red",
+	});
+	assert.deepEqual(parseStatusLine("report\nSTATUS: failure: tests red"), { kind: "failure", reason: "tests red" });
+	assert.deepEqual(parseStatusLine("report\nstatus: Failure - nope"), { kind: "failure", reason: "nope" });
+	assert.deepEqual(parseStatusLine("report\nSTATUS: failure with no separator"), {
+		kind: "failure",
+		reason: "with no separator",
+	});
+	// The last matching line wins.
+	assert.deepEqual(parseStatusLine("STATUS: failure — old\nbody\nSTATUS: success"), { kind: "success", reason: "" });
 });
 
 test("runPlan aborts in-flight nodes and marks pending ones aborted", async () => {

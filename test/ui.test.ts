@@ -103,6 +103,33 @@ test("update() treats node-restored like node-end (row done, re-render requested
 	assert.ok(lines[0].includes("1/2 done"), lines[0]);
 });
 
+test("update() shows the retry note while a transient-failure retry is in progress", () => {
+	const h = makeDashboard();
+	h.emit({ type: "node-start", nodeId: "a" });
+	const before = h.renders;
+	h.emit({
+		type: "node-retry",
+		nodeId: "a",
+		attempt: 1,
+		maxAttempts: 1,
+		reason: "subagent response was truncated (stopReason: length) — the model hit its output-token limit",
+	});
+	assert.equal(h.renders, before + 1, "re-render requested");
+	const row = h.dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("retry 1/1"), row);
+	assert.ok(row.includes("truncated"), row);
+
+	// node-end clears the retry note and shows the retry count on failure.
+	h.emit({
+		type: "node-end",
+		nodeId: "a",
+		result: result({ id: "a", status: "failed", startedAt: 0, finishedAt: 5000, retries: 1 }),
+	});
+	const failedRow = h.dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(!failedRow.includes("retry 1/1"), failedRow);
+	assert.ok(failedRow.includes("(1 retry)"), failedRow);
+});
+
 test("pending row shows the file-lock wait while a running node holds the resource", () => {
 	const lockPlan: DagPlan = {
 		goal: "lock goal",

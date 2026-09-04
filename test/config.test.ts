@@ -27,12 +27,14 @@ test("parseConfig accepts valid values", () => {
 	const { config, warnings } = parseConfig({
 		maxSteps: 30,
 		maxParallel: 8,
+		nodeRetries: 0,
 		plannerExplore: false,
 		plannerExtensions: ["/tmp/a.ts"],
 		runnerExtensions: ["/tmp/b.ts", "/tmp/c.ts"],
 	});
 	assert.equal(config.maxSteps, 30);
 	assert.equal(config.maxParallel, 8);
+	assert.equal(config.nodeRetries, 0);
 	assert.equal(config.plannerExplore, false);
 	assert.deepEqual(config.plannerExtensions, ["/tmp/a.ts"]);
 	assert.deepEqual(config.runnerExtensions, ["/tmp/b.ts", "/tmp/c.ts"]);
@@ -43,6 +45,7 @@ test("parseConfig falls back per bad key and warns", () => {
 	const { config, warnings } = parseConfig({
 		maxSteps: "twelve",
 		maxParallel: 0,
+		nodeRetries: -1,
 		plannerExplore: "yes",
 		plannerExtensions: "/tmp/a.ts",
 		runnerExtensions: ["/tmp/ok.ts", "", 42],
@@ -50,12 +53,14 @@ test("parseConfig falls back per bad key and warns", () => {
 	});
 	assert.equal(config.maxSteps, DEFAULT_CONFIG.maxSteps);
 	assert.equal(config.maxParallel, DEFAULT_CONFIG.maxParallel);
+	assert.equal(config.nodeRetries, DEFAULT_CONFIG.nodeRetries);
 	assert.equal(config.plannerExplore, DEFAULT_CONFIG.plannerExplore);
 	assert.deepEqual(config.plannerExtensions, []);
 	assert.deepEqual(config.runnerExtensions, ["/tmp/ok.ts"]);
-	assert.equal(warnings.length, 7);
+	assert.equal(warnings.length, 8);
 	assert.ok(warnings.some((w) => w.includes('"maxSteps"')));
 	assert.ok(warnings.some((w) => w.includes('"maxParallel"')));
+	assert.ok(warnings.some((w) => w.includes('"nodeRetries"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExplore"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExtensions"')));
 	assert.ok(warnings.some((w) => w.includes('"runnerExtensions"')));
@@ -66,6 +71,16 @@ test("parseConfig trims and de-duplicates extension entries", () => {
 	const { config, warnings } = parseConfig({ runnerExtensions: [" /tmp/a.ts ", "/tmp/a.ts", "\t/tmp/b.ts"] });
 	assert.deepEqual(config.runnerExtensions, ["/tmp/a.ts", "/tmp/b.ts"]);
 	assert.deepEqual(warnings, []);
+});
+
+test("parseConfig accepts nodeRetries >= 0 and rejects other values", () => {
+	assert.equal(parseConfig({ nodeRetries: 0 }).config.nodeRetries, 0);
+	assert.equal(parseConfig({ nodeRetries: 5 }).config.nodeRetries, 5);
+	for (const bad of [-1, 1.5, "twice", null]) {
+		const { config, warnings } = parseConfig({ nodeRetries: bad });
+		assert.equal(config.nodeRetries, DEFAULT_CONFIG.nodeRetries);
+		assert.ok(warnings.some((w) => w.includes('"nodeRetries"')));
+	}
 });
 
 // ---------------------------------------------------------------------------

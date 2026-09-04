@@ -296,7 +296,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			const dur =
 				r.startedAt !== undefined && r.finishedAt !== undefined ? ` ${formatDuration(r.finishedAt - r.startedAt)}` : "";
 			const usage = formatUsageStats(r.usage);
-			lines.push(`${statusIcon(r.status)} ${r.id} — ${r.title}${dur}${usage ? ` (${usage})` : ""}`);
+			const retryNote = r.retries ? ` (${r.retries} retry${r.retries > 1 ? "ies" : ""})` : "";
+			lines.push(`${statusIcon(r.status)} ${r.id} — ${r.title}${retryNote}${dur}${usage ? ` (${usage})` : ""}`);
 			if (r.status === "skipped" && r.skipReason) {
 				lines.push(`    ${r.skipReason}`);
 			} else {

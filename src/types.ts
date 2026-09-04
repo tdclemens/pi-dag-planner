@@ -72,6 +72,16 @@ export interface ToolSnippet {
 	args: Record<string, unknown>;
 }
 
+/**
+ * Why a node failed.
+ * - `"transient"` — infrastructure hiccup (subprocess crash, model/API error,
+ *   output truncation, empty response). The executor auto-retries these.
+ * - `"task"` — the agent finished its turn and reported that the step's goal
+ *   was not achieved (trailing `STATUS: failure` line). Auto-retrying the
+ *   same prompt is unlikely to help; the user can re-run via resume.
+ */
+export type FailureKind = "transient" | "task";
+
 /** The outcome of executing (or not) one DAG node. */
 export interface NodeResult {
 	id: string;
@@ -85,6 +95,10 @@ export interface NodeResult {
 	output: string;
 	/** Error message (model error, stderr excerpt) for failed nodes. */
 	error?: string;
+	/** How a failed node failed; drives auto-retry (transient) vs give-up (task). */
+	failureKind?: FailureKind;
+	/** Number of auto-retries performed after failed attempts (0/undefined = none). */
+	retries?: number;
 	exitCode?: number;
 	stopReason?: string;
 	/** Why a node was skipped, e.g. "dependency s1 failed". */
@@ -111,6 +125,12 @@ export type DagEvent =
 	 * changes (not every scheduler tick).
 	 */
 	| { type: "node-blocked"; nodeId: string; resource: string; heldBy: string }
+	/**
+	 * A failed attempt of a node is being auto-retried (transient failure
+	 * only). `attempt` is 1-based (the retry about to start), `maxAttempts` is
+	 * the configured retry cap, and `reason` is the previous attempt's error.
+	 */
+	| { type: "node-retry"; nodeId: string; attempt: number; maxAttempts: number; reason: string }
 	| { type: "node-end"; nodeId: string; result: NodeResult }
 	/**
 	 * A node that already completed in a prior (interrupted) run and was

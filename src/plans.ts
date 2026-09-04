@@ -123,7 +123,8 @@ export async function appendResults(planPath: string, results: NodeResult[], tot
 		for (const r of results) {
 			const dur = r.startedAt !== undefined && r.finishedAt !== undefined ? formatDuration(r.finishedAt - r.startedAt) : "—";
 			const excerpt = reportExcerpt(r);
-			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status} | ${dur} | ${r.stopReason ?? "—"} | ${excerpt ? tableEscape(excerpt) : "—"} |`);
+			const retryNote = r.retries ? ` (${r.retries} retry${r.retries > 1 ? "ies" : ""})` : "";
+			rows.push(`| ${r.id} | ${statusIcon(r.status)} ${r.status}${retryNote} | ${dur} | ${r.stopReason ?? "—"} | ${excerpt ? tableEscape(excerpt) : "—"} |`);
 		}
 		rows.push("");
 		rows.push(

@@ -443,6 +443,10 @@ interface DashboardRow {
 	finishedAt?: number;
 	/** File-lock serialization: this pending node waits on the resource. */
 	blockedBy?: { resource: string; heldBy: string };
+	/** Transient-failure auto-retry in progress (cleared on node-end). */
+	retry?: { attempt: number; maxAttempts: number; reason: string };
+	/** Retries performed on a finished node (summary suffix). */
+	retries?: number;
 }
 
 export class RunDashboard implements Component {
@@ -476,6 +480,9 @@ export class RunDashboard implements Component {
 		result?: NodeResult;
 		resource?: string;
 		heldBy?: string;
+		attempt?: number;
+		maxAttempts?: number;
+		reason?: string;
 	}): void {
 		const row = event.nodeId ? this.rows.get(event.nodeId) : undefined;
 		if (!row) return;
@@ -483,14 +490,24 @@ export class RunDashboard implements Component {
 			row.status = "running";
 			row.startedAt = Date.now();
 			row.blockedBy = undefined;
+			row.retry = undefined;
+			row.retries = undefined;
 		} else if (event.type === "snippet" && event.snippet) {
 			row.snippet = event.snippet;
 		} else if (event.type === "node-blocked" && event.resource && event.heldBy) {
 			row.blockedBy = { resource: event.resource, heldBy: event.heldBy };
+		} else if (event.type === "node-retry" && event.attempt !== undefined) {
+			row.retry = {
+				attempt: event.attempt,
+				maxAttempts: event.maxAttempts ?? event.attempt,
+				reason: event.reason ?? "",
+			};
 		} else if ((event.type === "node-end" || event.type === "node-restored") && event.result) {
 			row.status = event.result.status;
 			row.startedAt = event.result.startedAt ?? row.startedAt;
 			row.finishedAt = event.result.finishedAt ?? Date.now();
+			row.retry = undefined;
+			row.retries = event.result.retries;
 			if (event.result.snippets.length > 0) row.snippet = event.result.snippets[event.result.snippets.length - 1];
 		}
 		this.cachedWidth = undefined;
@@ -547,8 +564,11 @@ export class RunDashboard implements Component {
 			let line: string;
 			switch (row.status) {
 				case "running": {
+					const retry = row.retry
+						? t.fg("warning", ` (retry ${row.retry.attempt}/${row.retry.maxAttempts}: ${truncate(row.retry.reason, 48)})`)
+						: "";
 					const snippet = row.snippet ? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t)) : t.fg("dim", "…");
-					line = `${glyph} ${id}  ${node.title}  ${snippet}`;
+					line = `${glyph} ${id}  ${node.title}${retry}  ${snippet}`;
 					break;
 				}
 				case "done": {
@@ -557,7 +577,7 @@ export class RunDashboard implements Component {
 					break;
 				}
 				case "failed":
-					line = `${glyph} ${id}  ${node.title}`;
+					line = `${glyph} ${id}  ${node.title}${row.retries ? t.fg("muted", `  (${row.retries} retry${row.retries > 1 ? "ies" : ""})`) : ""}`;
 					break;
 				case "skipped":
 					line = `${glyph} ${id}  ${t.fg("dim", `${node.title} (skipped)`)}`;

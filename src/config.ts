@@ -11,6 +11,7 @@
  *   {
  *     "maxSteps": 12,            // soft step-count cap (planner guidance + plan-card warning)
  *     "maxParallel": 4,          // concurrent runner subagents
+ *     "nodeRetries": 1,          // auto-retries per node for transient failures (0 disables)
  *     "plannerExplore": true,    // planner explores the repo (read-only) before planning
  *     "plannerExtensions": [],   // extra extensions loaded into the planner subagent
  *     "runnerExtensions": []     // extra extensions loaded into every runner node subagent
@@ -29,7 +30,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_STEPS } from "./dag.ts";
-import { DEFAULT_MAX_PARALLEL } from "./executor.ts";
+import { DEFAULT_MAX_PARALLEL, DEFAULT_NODE_RETRIES } from "./executor.ts";
 
 /** Fully-resolved dag-plan configuration (defaults already applied). */
 export interface DagPlanConfig {
@@ -37,6 +38,12 @@ export interface DagPlanConfig {
 	maxSteps: number;
 	/** Max concurrent runner subagents. */
 	maxParallel: number;
+	/**
+	 * Max auto-retries per node for transient failures (subprocess crash,
+	 * model/API error, output truncation, empty response). Agent-reported
+	 * task failures are never auto-retried. 0 disables auto-retry.
+	 */
+	nodeRetries: number;
 	/**
 	 * Planner explores the repo as a read-only subagent before planning.
 	 * `false` = the faster single blind LLM call (no tools).
@@ -51,6 +58,7 @@ export interface DagPlanConfig {
 export const DEFAULT_CONFIG: DagPlanConfig = {
 	maxSteps: DEFAULT_MAX_STEPS,
 	maxParallel: DEFAULT_MAX_PARALLEL,
+	nodeRetries: DEFAULT_NODE_RETRIES,
 	plannerExplore: true,
 	plannerExtensions: [],
 	runnerExtensions: [],
@@ -135,6 +143,7 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 	const config: DagPlanConfig = {
 		maxSteps: DEFAULT_CONFIG.maxSteps,
 		maxParallel: DEFAULT_CONFIG.maxParallel,
+		nodeRetries: DEFAULT_CONFIG.nodeRetries,
 		plannerExplore: DEFAULT_CONFIG.plannerExplore,
 		plannerExtensions: [],
 		runnerExtensions: [],
@@ -149,6 +158,11 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 			case "maxParallel": {
 				const n = positiveInt(value, key, warnings);
 				if (n !== undefined) config.maxParallel = n;
+				break;
+			}
+			case "nodeRetries": {
+				const n = nonNegativeInt(value, key, warnings);
+				if (n !== undefined) config.nodeRetries = n;
 				break;
 			}
 			case "plannerExplore":
@@ -203,6 +217,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 function positiveInt(value: unknown, key: string, warnings: string[]): number | undefined {
 	if (typeof value === "number" && Number.isInteger(value) && value >= 1) return value;
 	warnings.push(`"${key}" must be an integer >= 1 (got ${describe(value)}) — using default`);
+	return undefined;
+}
+
+function nonNegativeInt(value: unknown, key: string, warnings: string[]): number | undefined {
+	if (typeof value === "number" && Number.isInteger(value) && value >= 0) return value;
+	warnings.push(`"${key}" must be an integer >= 0 (got ${describe(value)}) — using default`);
 	return undefined;
 }
 

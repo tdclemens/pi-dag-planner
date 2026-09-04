@@ -16,6 +16,8 @@ import type { DagEvent, DagNode, DagPlan, NodeResult, NodeStatus, UsageStats } f
 import { addUsage, emptyUsage } from "./types.ts";
 
 export const DEFAULT_MAX_PARALLEL = 4;
+/** Default auto-retries per node for transient failures (config "nodeRetries"). */
+export const DEFAULT_NODE_RETRIES = 1;
 const DEP_OUTPUT_PER_CAP = 8 * 1024;
 const DEP_OUTPUT_TOTAL_CAP = 16 * 1024;
 const MAX_SNIPPETS = 200;
@@ -37,6 +39,13 @@ export function getMaxParallel(config?: DagPlanConfig): number {
 	return DEFAULT_MAX_PARALLEL;
 }
 
+/** Retry cap from config "nodeRetries" (defaults to DEFAULT_NODE_RETRIES). */
+export function getMaxRetries(config?: DagPlanConfig): number {
+	const n = config?.nodeRetries;
+	if (typeof n === "number" && Number.isInteger(n) && n >= 0) return n;
+	return DEFAULT_NODE_RETRIES;
+}
+
 /**
  * Resolve how to invoke `pi` from within pi (ported from the subagent
  * example): reuse our own entrypoint when we know it, else fall back to `pi`
@@ -55,12 +64,30 @@ export function getPiInvocation(args: string[]): { command: string; args: string
 	return { command: "pi", args };
 }
 
+/**
+ * Parse the node status contract out of a final report: the LAST line
+ * matching `STATUS: success` or `STATUS: failure — <reason>` (case-
+ * insensitive; `—`, `:`, `-` or nothing may separate the kind from the
+ * reason). Returns null when the report carries no status line — omission
+ * is not a failure (keeps old reports compatible).
+ */
+export function parseStatusLine(output: string): { kind: "success" | "failure"; reason: string } | null {
+	const lines = output.split("\n");
+	for (let i = lines.length - 1; i >= 0; i--) {
+		const m = lines[i]!.trim().match(/^STATUS:\s*(success|failure)\b\s*(?:—|:|-)?\s*(.*)$/i);
+		if (m) return { kind: m[1]!.toLowerCase() as "success" | "failure", reason: m[2]!.trim() };
+	}
+	return null;
+}
+
 /** Build the self-contained task prompt for a node, injecting dep outputs. */
 export function buildTaskPrompt(
 	plan: DagPlan,
 	node: DagNode,
 	depOutputs: Map<string, string>,
 	originalPrompt?: string,
+	/** Previous-attempt failure reason for auto-retries (omitted on first attempt). */
+	retryNote?: string,
 ): string {
 	const lines: string[] = [
 		"You are executing one node of a larger plan. Work autonomously and verify your own output.",
@@ -87,11 +114,18 @@ export function buildTaskPrompt(
 			lines.push("", `[${id}] ${title}`, out);
 		}
 	}
+	if (retryNote) {
+		lines.push(
+			"",
+			`A previous attempt at this step failed: ${retryNote}`,
+			"That attempt may have left partial changes in the repository. Inspect the current state first, keep what is correct, and complete the step from where it left off.",
+		);
+	}
 	lines.push(
 		"",
 		"Other steps of this plan may be running at the same time in this same repository. If a write or edit is rejected because the file changed since you last read it (DAG file lock), re-read the file and re-apply your change against the fresh content. If the same file keeps conflicting, do the rest of your task and report the conflict instead of retrying it.",
 		"",
-		"When finished, reply with a concise markdown report: what you did, and the artifacts (file paths, commands, values) that later steps need.",
+		"When finished, reply with a concise markdown report: what you did, and the artifacts (file paths, commands, values) that later steps need. End the report with a final line: `STATUS: success` if the step's goal was achieved, or `STATUS: failure — <short reason>` if it was not (for example, tests you were asked to make pass still fail).",
 	);
 	return lines.join("\n");
 }
@@ -202,14 +236,50 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 	async function executeNode(node: DagNode): Promise<void> {
 		status.set(node.id, "running");
 		onEvent({ type: "node-start", nodeId: node.id });
-		let result: NodeResult;
+		const maxRetries = getMaxRetries(opts.config);
+		let result = await runAttempt(node, undefined);
+		let retries = 0;
+		// Auto-retry transient failures (subprocess crash, model/API error,
+		// truncation, empty response) — the previous attempt's error is fed
+		// back into the retry prompt. Task failures (the agent reported the
+		// goal unmet) and aborts are left for the user; resume re-runs them.
+		while (
+			result.status === "failed" &&
+			result.failureKind === "transient" &&
+			retries < maxRetries &&
+			!opts.signal.aborted
+		) {
+			retries++;
+			onEvent({
+				type: "node-retry",
+				nodeId: node.id,
+				attempt: retries,
+				maxAttempts: maxRetries,
+				reason: result.error ?? "unknown error",
+			});
+			const prev = result;
+			result = await runAttempt(node, result.error ?? "unknown error");
+			// Usage accumulates across attempts; the wall-clock span covers the
+			// whole node, not just the final attempt.
+			result.usage = addUsage(prev.usage, result.usage);
+			result.startedAt = prev.startedAt;
+		}
+		if (retries > 0) result.retries = retries;
+		emitEnd(node.id, result);
+		if (result.status === "done") doneIds.add(node.id);
+		else markSkipped(node.id, `dependency ${node.id} ${result.status}`);
+	}
+
+	/** One node attempt (crash-safe); `retryNote` is the previous failure reason. */
+	async function runAttempt(node: DagNode, retryNote?: string): Promise<NodeResult> {
 		try {
-			result = await runNodeSubagent(plan, node, opts, results);
+			return await runNodeSubagent(plan, node, opts, results, retryNote);
 		} catch (e) {
-			result = {
+			return {
 				id: node.id,
 				title: node.title,
 				status: "failed",
+				failureKind: "transient",
 				startedAt: Date.now(),
 				finishedAt: Date.now(),
 				snippets: [],
@@ -218,9 +288,6 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 				usage: emptyUsage(),
 			};
 		}
-		emitEnd(node.id, result);
-		if (result.status === "done") doneIds.add(node.id);
-		else markSkipped(node.id, `dependency ${node.id} ${result.status}`);
 	}
 
 	while (true) {
@@ -447,6 +514,7 @@ async function runNodeSubagent(
 	node: DagNode,
 	opts: RunPlanOptions,
 	results: Map<string, NodeResult>,
+	retryNote?: string,
 ): Promise<NodeResult> {
 	const startedAt = Date.now();
 	const depOutputs = new Map<string, string>();
@@ -454,7 +522,7 @@ async function runNodeSubagent(
 		const r = results.get(d);
 		if (r && r.status === "done") depOutputs.set(d, r.output);
 	}
-	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt);
+	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt, retryNote);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "-e", LOCK_GUARD_PATH];
 	// Configured extra extensions (resolved absolute paths from the config
@@ -498,10 +566,15 @@ async function runNodeSubagent(
 	result.stopReason = run.stopReason;
 	result.error = run.modelError;
 
+	// Trailing status line from the report contract (see buildTaskPrompt);
+	// null = the agent did not report a status (not a failure).
+	const reported = parseStatusLine(run.output);
+
 	if (run.wasAborted) {
 		result.status = "aborted";
 	} else if (run.exitCode !== 0 || run.stopReason === "error") {
 		result.status = "failed";
+		result.failureKind = "transient";
 		if (!result.error) {
 			const tail = run.stderr.trim().split("\n").slice(-3).join(" ").slice(-500);
 			result.error = tail || `subagent exited with code ${run.exitCode}`;
@@ -512,13 +585,29 @@ async function runNodeSubagent(
 		// complete (its "report" is a fragment, and any tool calls in that
 		// message were discarded by pi).
 		result.status = "failed";
+		result.failureKind = "transient";
 		result.error ??= "subagent response was truncated (stopReason: length) — the model hit its output-token limit before finishing the step";
 	} else if (result.snippets.length === 0) {
 		// No tool calls at all: the subagent ended without doing any work
 		// (e.g. a single text-only message). Marking it "done" would feed
-		// dependents a report about work that never happened.
+		// dependents a report about work that never happened. An explicit
+		// STATUS: failure line makes it a task failure; otherwise treat it
+		// as a glitch worth one retry.
 		result.status = "failed";
-		result.error ??= "subagent made no tool calls — it ended without doing any work (empty or truncated response)";
+		if (reported && reported.kind === "failure") {
+			result.failureKind = "task";
+			result.error = `step reported failure: ${reported.reason || "no reason given"}`;
+		} else {
+			result.failureKind = "transient";
+			result.error ??= "subagent made no tool calls — it ended without doing any work (empty or truncated response)";
+		}
+	} else if (reported && reported.kind === "failure") {
+		// The agent did work and finished its turn, but explicitly reported
+		// that the step's goal was not achieved — a task failure. Auto-retry
+		// is unlikely to help; the user can re-run the node via resume.
+		result.status = "failed";
+		result.failureKind = "task";
+		result.error = `step reported failure: ${reported.reason || "no reason given"}`;
 	} else {
 		result.status = "done";
 	}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import { KeybindingsManager } from "@earendil-works/pi-tui";
 import { reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
 import type { DagEvent, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
@@ -247,6 +248,72 @@ test("Escape triggers onAbort; other keys are ignored", () => {
 	assert.equal(h.aborts, 0);
 	h.dashboard.handleInput("\x1b");
 	assert.equal(h.aborts, 1);
+});
+
+/** Dashboard wired up like index.ts: app keybindings + tool-output toggle. */
+function makeExpandableDashboard(initialExpanded = false) {
+	let expanded = initialExpanded;
+	const state = { toggles: 0, renders: 0 };
+	const keybindings = new KeybindingsManager({ "app.tools.expand": { defaultKeys: "ctrl+o" } });
+	const dashboard = new RunDashboard(
+		plan,
+		theme,
+		() => {},
+		() => state.renders++,
+		keybindings,
+		() => {
+			state.toggles++;
+			expanded = !expanded;
+		},
+		() => expanded,
+	);
+	return { dashboard, keybindings, state };
+}
+
+test("the expand key (Ctrl+O by default) toggles tool output and re-renders the header", () => {
+	const { dashboard, state } = makeExpandableDashboard();
+	let header = dashboard.render(W)[0];
+	assert.ok(header.includes("(esc: cancel)"), header);
+	assert.ok(header.includes("(ctrl+o: expand output)"), header);
+
+	dashboard.handleInput("\x0f"); // Ctrl+O
+	assert.equal(state.toggles, 1, "must forward the app's expand key");
+	assert.equal(state.renders, 1, "must request a re-render (header hint flips)");
+	header = dashboard.render(W)[0];
+	assert.ok(header.includes("(ctrl+o: collapse output)"), header);
+
+	dashboard.handleInput("\x0f");
+	assert.equal(state.toggles, 2);
+	assert.ok(dashboard.render(W)[0].includes("(ctrl+o: expand output)"), "toggles back");
+
+	// The expand key must not cancel the run, and unrelated keys stay inert.
+	dashboard.handleInput("\x1b");
+	assert.equal(state.toggles, 2);
+});
+
+test("the expand key honors user remaps", () => {
+	let toggles = 0;
+	// User remapped app.tools.expand from ctrl+o to ctrl+e.
+	const keybindings = new KeybindingsManager(
+		{ "app.tools.expand": { defaultKeys: "ctrl+o" } },
+		{ "app.tools.expand": "ctrl+e" },
+	);
+	const dashboard = new RunDashboard(plan, theme, () => {}, () => {}, keybindings, () => toggles++, () => false);
+	assert.ok(dashboard.render(W)[0].includes("(ctrl+e: expand output)"), dashboard.render(W)[0]);
+	dashboard.handleInput("\x0f"); // ctrl+o is no longer bound
+	assert.equal(toggles, 0, "unbound ctrl+o must not toggle");
+	dashboard.handleInput("\x05"); // remapped ctrl+e
+	assert.equal(toggles, 1, "remapped key toggles");
+});
+
+test("without keybindings the dashboard stays inert for Ctrl+O (backward compatible)", () => {
+	let toggles = 0;
+	const dashboard = new RunDashboard(plan, theme, () => {}, () => {}, undefined, () => toggles++, () => false);
+	dashboard.handleInput("\x0f");
+	assert.equal(toggles, 0);
+	const header = dashboard.render(W)[0];
+	assert.ok(header.includes("(esc: cancel)"), header);
+	assert.ok(!header.includes(": expand output"), "no expand hint when unwired");
 });
 
 // ---------------------------------------------------------------------------

@@ -36,14 +36,14 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
-   DAG runner — 2/4 done, 1 running, 1 pending (esc: cancel)
+   DAG runner — 2/4 done, 1 running, 1 pending (esc: cancel) (ctrl+o: expand output)
    ✓ s1  Survey repo structure              14.2s
    ✓ s2  Read src/parser.ts and its usages  18.9s
    ▶ s3  Write tests for parser   → $ ls src/
    ○ s4  Run tests and fix failures (waiting: s3)
    ```
 
-   When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. Each node's result is also checkpointed to the run-state sidecar (`<plan>.run.json`) as it completes, so an interrupted run can be resumed (see [Resume](#resume)). **Esc** cancels the run (children are terminated, state is finalized).
+   When a node finishes, a subagent-style card is appended to the transcript (command snippets, final output, usage), and the markdown plan file gets a **Results** section. Each node's result is also checkpointed to the run-state sidecar (`<plan>.run.json`) as it completes, so an interrupted run can be resumed (see [Resume](#resume)). **Esc** cancels the run (children are terminated, state is finalized). **Ctrl+O** works while the run is executing too: it expands the per-node cards in the transcript so you can read each finished step's full report (and collapses them again), just like Ctrl+O elsewhere in pi.
 
    Node status icons (single-cell, non-emoji, so the column aligns in any terminal): `○` pending · `▶` running · `✓` done · `✗` failed · `⊘` skipped · `■` aborted. Usage lines show `↑` input tokens, `↓` output tokens, `R`/`W` cache read/write, then cost and model. A pending node waiting on the file lock shows why: `○ s4  Run tests (file lock: package-lock.json held by s1)`.
 
@@ -96,7 +96,7 @@ Examples:
 /dag-plan Audit the repo for TODOs, group them by module, and draft an issue per group
 ```
 
-- **Ctrl+O** on the plan card expands the raw JSON.
+- **Ctrl+O** expands collapsed content: the raw JSON on the plan card, and — while the runner panel is on screen — the per-node full reports in the transcript.
 - **Refine** lets you steer the plan before spending tokens on execution ("make it at most 4 steps", "don't touch the database layer").
 - The plan file in `~/.agents/plans/` is the durable record: goal, steps, JSON, and post-execution results.
 

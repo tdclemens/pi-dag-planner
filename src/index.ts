@@ -217,8 +217,21 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 
 		ctx.ui.setStatus(STATUS_KEY, `0/${totalSteps} running…`);
 
-		const results: NodeResult[] | undefined = await ctx.ui.custom<NodeResult[] | undefined>((tui, theme, _kb, done) => {
-			const dashboard = new RunDashboard(dag, theme, () => controller.abort(), () => tui.requestRender());
+		const results: NodeResult[] | undefined = await ctx.ui.custom<NodeResult[] | undefined>((tui, theme, keybindings, done) => {
+			// While the dashboard is on screen it holds keyboard focus, so the
+			// app's Ctrl+O (the app.tools.expand binding, owned by the default
+			// editor) never fires. The dashboard matches the key itself; we flip
+			// the transcript's expansion so the per-node cards reveal each
+			// finished step's full output mid-run.
+			const dashboard = new RunDashboard(
+				dag,
+				theme,
+				() => controller.abort(),
+				() => tui.requestRender(),
+				keybindings,
+				() => ctx.ui.setToolsExpanded(!ctx.ui.getToolsExpanded()),
+				() => ctx.ui.getToolsExpanded(),
+			);
 			const promise = runPlan(dag, {
 				cwd: ctx.cwd,
 				model: modelLabel,

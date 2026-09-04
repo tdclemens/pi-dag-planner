@@ -13,6 +13,7 @@ import {
 	Text,
 	truncateToWidth,
 	type Component,
+	type KeybindingsManager,
 } from "@earendil-works/pi-tui";
 import { topologicalLevels } from "./dag.ts";
 import type { DagNode, DagPlan, NodeResult, NodeStatus, ToolSnippet, UsageStats } from "./types.ts";
@@ -462,12 +463,25 @@ export class RunDashboard implements Component {
 	 * @param onRender  called after every state change; the host must forward
 	 *                  this to `tui.requestRender()` because pi-tui only
 	 *                  repaints when explicitly asked (no periodic frames)
+	 * @param keybindings  the app's keybindings (3rd `ui.custom` factory arg).
+	 *                  When provided, the expand key (Ctrl+O by default, the
+	 *                  `app.tools.expand` binding) is handled here — while the
+	 *                  dashboard is on screen it holds keyboard focus and the
+	 *                  default editor, which normally owns that binding, is out
+	 *                  of the tree
+	 * @param onToggleExpand  called on the expand key; the host flips the app's
+	 *                  tool-output expansion (`ctx.ui.setToolsExpanded`) so the
+	 *                  per-node transcript cards show each step's full output
+	 * @param isExpanded  current app expansion state, used for the header hint
 	 */
 	constructor(
 		private plan: DagPlan,
 		private theme: Theme,
 		private onAbort: () => void,
 		private onRender: () => void,
+		private keybindings?: KeybindingsManager,
+		private onToggleExpand?: () => void,
+		private isExpanded?: () => boolean,
 	) {
 		for (const node of plan.steps) this.rows.set(node.id, { status: "pending" });
 	}
@@ -520,7 +534,19 @@ export class RunDashboard implements Component {
 	}
 
 	handleInput(data: string): void {
-		if (matchesKey(data, Key.escape)) this.onAbort();
+		if (matchesKey(data, Key.escape)) {
+			this.onAbort();
+			return;
+		}
+		// Expand key (Ctrl+O by default): toggle the transcript's expansion so
+		// each finished step's full output is visible mid-run, exactly like
+		// Ctrl+O anywhere else in pi.
+		if (this.keybindings?.matches(data, "app.tools.expand")) {
+			this.onToggleExpand?.();
+			this.invalidate(); // flip the header hint
+			this.onRender();
+			return;
+		}
 		// All other keys are ignored; the dashboard is not editable.
 	}
 
@@ -551,9 +577,12 @@ export class RunDashboard implements Component {
 		}
 
 		const lines: string[] = [];
+		const expandHint = this.expandKeyLabel()
+			? t.fg("dim", ` (${this.expandKeyLabel()}: ${this.isExpanded?.() ? "collapse" : "expand"} output)`)
+			: "";
 		const header = this.finished
-			? t.fg("accent", t.bold("DAG runner — finished"))
-			: `${t.fg("accent", t.bold("DAG runner"))} ${t.fg("muted", `— ${done}/${total} done, ${running} running, ${pending} pending`)} ${t.fg("dim", "(esc: cancel)")}`;
+			? `${t.fg("accent", t.bold("DAG runner — finished"))}${expandHint}`
+			: `${t.fg("accent", t.bold("DAG runner"))} ${t.fg("muted", `— ${done}/${total} done, ${running} running, ${pending} pending`)} ${t.fg("dim", "(esc: cancel)")}${expandHint}`;
 		lines.push(truncateToWidth(header, width, ""));
 
 		const maxIdLen = Math.max(0, ...this.plan.steps.map((s) => s.id.length));
@@ -607,5 +636,11 @@ export class RunDashboard implements Component {
 			lines.push(truncateToWidth(t.fg("warning", `${failed} failed — dependent nodes will be skipped`), width, ""));
 		}
 		return lines;
+	}
+
+	/** Label for the expand key (honors user remaps); empty when unwired. */
+	private expandKeyLabel(): string {
+		const keys = this.keybindings?.getKeys("app.tools.expand") ?? [];
+		return keys.length > 0 ? keys.join("/") : "";
 	}
 }

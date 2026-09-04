@@ -26,7 +26,7 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `plannerExplore: false` in the config (see [Configuration](#configuration)) for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card.
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `plannerExplore: false` in the config (see [Configuration](#configuration)) for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card. A `PLAN.md` in the project root is injected into the planner as project-specific planning instructions (see [Planning instructions (PLAN.md)](#planning-instructions-planmd)).
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
@@ -56,6 +56,24 @@ Nodes run as parallel subagents **in the same working directory**, so two nodes 
 3. **Per-node file lock (optimistic concurrency)** — every node subagent loads `src/lock-guard.ts`, which hashes each file the node reads and vetoes `write`/`edit` calls whose target changed since that read: the tool call is blocked with an instruction to **re-read and re-apply**. After 3 stale retries on one file the node is told to stop touching it and report the conflict, so a hot file cannot burn the run in a retry loop. This is detect-and-retry, not a held lock — an agent thinks for minutes between read and write, so pessimistic locking would serialize everything. It catches overlap the planner failed to declare (including files rewritten by another node's *bash* commands).
 
 Known gap: writes done purely through `bash` (e.g. `npm install` regenerating a lockfile) are not intercepted — declare them as `touches` so the executor serializes the owning steps, and the file lock will at least make any such collision *visible* to the affected node (one extra re-read).
+
+## Planning instructions (PLAN.md)
+
+A `PLAN.md` in the **project root** is read by the **`/dag-plan` planner** as project-specific planning instructions — the same role `AGENTS.md`/`CLAUDE.md` play for an agent, but scoped to the planner. On **every plan and refine attempt** its (trimmed) contents are injected into the planner prompt ahead of the task under the header `Project planning instructions (from PLAN.md):`, and both planner prompts — the exploring subagent and the blind single call — tell the model to treat that section as authoritative project guidance for the plan.
+
+- **Planner-only.** The executor never reads `PLAN.md`, and the executing node subagents never see it — it shapes the plan, not its execution.
+- **Optional.** Without a `PLAN.md` — or when it is missing, unreadable, or whitespace-only — behavior is exactly as before.
+- **Capped at 50 KB.** Only the first 50 KB (51,200 characters) is injected; longer files are cut there with a `…(PLAN.md truncated)` marker.
+
+Example `PLAN.md`:
+
+```markdown
+# Planning instructions for this repo
+
+- Always end the plan with a step that runs the full test suite and fixes failures until green.
+- Keep plans under 5 steps; prefer fewer, larger steps.
+- Never modify the database schema or the `vendor/` directory.
+```
 
 ## Install
 
@@ -186,7 +204,7 @@ Fixed limits (not configurable): hard step ceiling `32` (raised to
 `maxSteps` when that is higher — plans above the ceiling are rejected and
 re-planned), 1 planning retry on invalid JSON, 3 refine attempts, plan
 directory `~/.agents/plans/`, 8 KB per dep / 16 KB total injected into node
-prompts.
+prompts, and a 50 KB cap on the injected `PLAN.md`.
 
 ### Extra extensions for planner / runner
 

@@ -7,6 +7,8 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, type DagPlanConfig } from "./config.ts";
@@ -59,7 +61,8 @@ Rules:
 - Prefer direct action over research steps: you already explored the repo. Include an execution-time discovery step only for what you could not determine statically (e.g. runtime behavior, a flaky-test baseline).
 - Keep each step to one focused subagent session: split large work into per-module steps rather than one giant step, and keep each prompt under ~150 words.
 - No git mutations (commits, pushes, branches) or destructive operations unless the user's request explicitly requires them; if a commit is required, make it a single final step after all edits.
-- "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.`;
+- "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
+- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan.`;
 }
 
 /** Fallback prompt for the blind single-call planner (no tools). */
@@ -88,7 +91,8 @@ Rules:
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
 - "touches" (required for steps that modify anything): the exact file paths the step creates or modifies, plus shared resources its commands mutate (lockfiles, build dirs, ports); read-only steps use []. Overlapping touches are serialized at run time — keep them disjoint or order the steps with dependsOn.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
-- The last step(s) should verify the work (run tests, build, or report findings).`;
+- The last step(s) should verify the work (run tests, build, or report findings).
+- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan.`;
 }
 
 /** Read-only tools the exploring planner is allowed to use. */
@@ -100,6 +104,40 @@ export const PLANNER_EXPLORE_TOOLS = ["read", "grep", "find", "ls"];
  */
 export function plannerExplores(config?: DagPlanConfig): boolean {
 	return config?.plannerExplore ?? true;
+}
+
+/**
+ * Project-specific planning instructions file, read from the project root
+ * (the cwd of the /dag-plan invocation). Like AGENTS.md/CLAUDE.md for an
+ * agent, but scoped to the planner only: the executor never reads it, and
+ * it is not passed to node subagents.
+ */
+export const PLANNER_INSTRUCTIONS_FILE = "PLAN.md";
+
+/** Max PLAN.md characters injected into the planner prompt (50 KB). */
+export const MAX_PLAN_MD_CHARS = 50 * 1024;
+
+/**
+ * Load the project's PLAN.md as planner instructions. Resolves
+ * <cwd>/PLAN.md, trims it, and caps it at MAX_PLAN_MD_CHARS (appending the
+ * "…(PLAN.md truncated)" marker when truncated). Returns undefined when
+ * cwd is missing, the file is absent or unreadable, or it is
+ * whitespace-only. Never throws — planner instructions are optional.
+ */
+export async function loadPlannerInstructions(cwd?: string): Promise<string | undefined> {
+	if (!cwd) return undefined;
+	let text: string;
+	try {
+		text = await readFile(resolve(cwd, PLANNER_INSTRUCTIONS_FILE), "utf8");
+	} catch {
+		return undefined;
+	}
+	const trimmed = text.trim();
+	if (!trimmed) return undefined;
+	if (trimmed.length > MAX_PLAN_MD_CHARS) {
+		return `${trimmed.slice(0, MAX_PLAN_MD_CHARS)}…(PLAN.md truncated)`;
+	}
+	return trimmed;
 }
 
 /**
@@ -269,7 +307,10 @@ export interface PlanOptions {
 /**
  * Produce a plan. Default: the planner runs as a read-only pi subagent that
  * explores the repo, and the plan JSON is extracted from its final message.
- * With plannerExplore: false (config): single blind LLM completion. Returns
+ * With plannerExplore: false (config): single blind LLM completion. When the
+ * project root (ctx.cwd) has a PLAN.md, its contents are injected into the
+ * user text as planner-only project planning instructions
+ * (loadPlannerInstructions) — the executing subagents never see it. Returns
  * null when aborted (Esc), throws a PlanError with a diagnostic otherwise
  * (the raw output that failed to parse/validate is attached when available).
  */
@@ -283,7 +324,13 @@ export async function plan(
 	if (!model) throw new Error("no model selected (use /model)");
 	const cfg = opts.config ?? DEFAULT_CONFIG;
 
-	const parts: string[] = [`Plan this task:\n\n${prompt}`];
+	const parts: string[] = [];
+	const planMd = await loadPlannerInstructions(ctx.cwd);
+	if (planMd)
+		parts.push(
+			`Project planning instructions (from PLAN.md):\n${planMd}\nThese are planning-only instructions: follow them when shaping the plan; they are not visible to the executing subagents.`,
+		);
+	parts.push(`Plan this task:\n\n${prompt}`);
 	if (opts.priorPlanJson)
 		parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
 	if (opts.feedback) {

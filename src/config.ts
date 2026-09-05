@@ -9,7 +9,7 @@
  *   <cwd>/.pi/dag-plan.json      project-local (trusted projects only)
  *
  *   {
- *     "maxSteps": 12,            // soft step-count cap (planner guidance + plan-card warning)
+ *     "maxSteps": 20,            // soft step-count cap (planner guidance + plan-card warning)
  *     "maxParallel": 4,          // concurrent runner subagents
  *     "nodeRetries": 1,          // auto-retries per node for transient failures (0 disables)
  *     "plannerExplore": true,    // planner explores the repo (read-only) before planning

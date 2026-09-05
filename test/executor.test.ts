@@ -686,6 +686,18 @@ test("buildTaskPrompt omits the original request when not provided or blank", ()
 	assert.ok(!p2.includes("Original request"));
 });
 
+test("buildTaskPrompt enforces scope discipline (fail fast on oversized steps)", () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const prompt = buildTaskPrompt(plan, plan.steps[0]!, new Map());
+	assert.match(prompt, /Scope discipline/i);
+	assert.match(prompt, /do not grind for hours/i);
+	assert.match(prompt, /remaining: <what is left>/);
+	assert.match(prompt, /re-scoped into smaller steps/i);
+	// Placed before the final report instruction, after the file-lock note.
+	assert.ok(prompt.indexOf("Scope discipline") < prompt.indexOf("When finished, reply with a concise markdown report"));
+	assert.ok(prompt.indexOf("DAG file lock") < prompt.indexOf("Scope discipline"));
+});
+
 test("runPlan passes the original request into every node prompt", async () => {
 	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2", ["s1"])] };
 	const h = makeHarness();

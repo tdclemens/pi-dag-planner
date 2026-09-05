@@ -11,7 +11,7 @@ import type { DagNode, DagPlan, PlanValidation } from "./types.ts";
 export type { PlanValidation };
 
 /** Recommended (soft) step count: planner guidance + plan-card warning. */
-export const DEFAULT_MAX_STEPS = 12;
+export const DEFAULT_MAX_STEPS = 20;
 
 /**
  * Hard step-count ceiling enforced by validatePlan: a runaway plan that
@@ -82,7 +82,41 @@ export function validatePlan(plan: unknown, config?: DagPlanConfig): PlanValidat
 			`plan has ${steps.length} steps (recommended max ${softMax} — raise "maxSteps" in dag-plan.json) — each step is a separate agent session, review before executing`,
 		);
 	warnings.push(...touchesOverlapWarnings(steps));
+	warnings.push(...stepSizeWarnings(steps));
 	return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+}
+
+/**
+ * Step-size heuristic: a step prompt's word count is the cheapest proxy for
+ * its scope. Healthy steps (one file / one feature) stay near
+ * STEP_PROMPT_TARGET_WORDS; prompts above STEP_PROMPT_WARN_WORDS usually
+ * bundle several files or features into one subagent session — the failure
+ * mode where the session's context bloats, the final report truncates at the
+ * output limit, and a retry redoes hours of work from a half-finished state.
+ * validatePlan reports one non-fatal warning per oversized step (surfaced on
+ * the plan card) rather than rejecting: a dense single-file step may
+ * legitimately run long.
+ */
+export const STEP_PROMPT_TARGET_WORDS = 150;
+export const STEP_PROMPT_WARN_WORDS = 200;
+
+/** Count words in a step prompt (whitespace-split, trimmed). */
+export function stepPromptWords(prompt: string): number {
+	const t = prompt.trim();
+	return t ? t.split(/\s+/).length : 0;
+}
+
+/** One warning per step whose prompt outgrows the one-unit-of-work budget. */
+export function stepSizeWarnings(steps: DagNode[]): string[] {
+	const warnings: string[] = [];
+	for (const s of steps) {
+		const words = stepPromptWords(s.prompt);
+		if (words > STEP_PROMPT_WARN_WORDS)
+			warnings.push(
+				`step "${s.id}" prompt is ${words} words — likely too big for one subagent session (target ≤${STEP_PROMPT_TARGET_WORDS} words: one file or one feature). Consider splitting it into smaller steps`,
+			);
+	}
+	return warnings;
 }
 
 /**

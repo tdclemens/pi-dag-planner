@@ -220,8 +220,8 @@ test("buildPlannerArgs loads configured planner extensions and drops the read-on
 });
 
 test("planner prompts interpolate the soft step cap", () => {
-	assert.match(plannerSystemPrompt(12), /up to 12 for large multi-module tasks/);
-	assert.match(plannerSystemPrompt(20), /up to 20 for large multi-module tasks/);
+	assert.match(plannerSystemPrompt(12), /up to 12 for large multi-module builds/);
+	assert.match(plannerSystemPrompt(20), /up to 20 for large multi-module builds/);
 	assert.doesNotMatch(plannerSystemPrompt(20), /up to 12/);
 	assert.match(blindPlannerPrompt(15), /up to 15 for large multi-module tasks/);
 });
@@ -241,6 +241,19 @@ test("agentic prompt requires exploration + verification; both prompts contract 
 	assert.match(blindPlannerPrompt(12), /ONLY a JSON object/i);
 	assert.match(blindPlannerPrompt(12), /"touches"/);
 	assert.match(blindPlannerPrompt(12), /serialized at run time/);
+});
+
+test("planner prompts enforce fine-grained steps (one unit of work per step)", () => {
+	for (const p of [plannerSystemPrompt(12), blindPlannerPrompt(12)]) {
+		assert.doesNotMatch(p, /Prefer fewer, larger steps over many thin ones/i, "old coarse-granularity guidance removed");
+		assert.match(p, /one unit of work per step/i);
+		assert.match(p, /Prefer more, smaller steps over fewer, larger ones/i);
+		assert.match(p, /2\+ substantial files/i, "split rule: multiple substantial files");
+		assert.match(p, /~150 words/i, "soft per-step prompt budget");
+	}
+	const agentic = plannerSystemPrompt(12);
+	assert.match(agentic, /decompose before writing any JSON/i);
+	assert.match(agentic, /end green/i, "each step must end in a verified state");
 });
 
 test("plannerExplores reads the config flag (on by default)", () => {
@@ -483,6 +496,7 @@ test("plan() retry prompt includes the failed output and a conciseness hint for 
 	assert.ok(prompts[1].includes(truncatedPlanText), "retry includes the raw broken text");
 	assert.match(prompts[1], /cut off before the JSON was complete/i, "truncation hint present");
 	assert.match(prompts[1], /more concise plan/i);
+	assert.match(prompts[1], /keep the same step structure/i, "truncation ≠ coarser plan: keep granularity, shorten prompts");
 });
 
 test("plan() blind path attaches the raw output and honors the truncation hint", async () => {
@@ -514,6 +528,7 @@ test("plan() blind path attaches the raw output and honors the truncation hint",
 	);
 	assert.ok(capturedText!.includes(truncatedPlanText), "prior output included in the prompt");
 	assert.match(capturedText!, /more concise plan/i, "truncation hint included");
+	assert.match(capturedText!, /keep the same step structure/i);
 });
 
 // ---------------------------------------------------------------------------

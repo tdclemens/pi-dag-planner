@@ -125,6 +125,8 @@ export function buildTaskPrompt(
 		"",
 		"Other steps of this plan may be running at the same time in this same repository. If a write or edit is rejected because the file changed since you last read it (DAG file lock), re-read the file and re-apply your change against the fresh content. If the same file keeps conflicting, do the rest of your task and report the conflict instead of retrying it.",
 		"",
+		"Scope discipline: if the step turns out substantially larger than its prompt describes, do not grind for hours. Stop once the repository is in a consistent, verified state (everything you finished still typechecks/tests green), and end with `STATUS: failure — <short reason> — remaining: <what is left>` so the plan can be re-scoped into smaller steps. A fast, honest failure beats a marathon session that truncates and has to be redone.",
+		"",
 		"When finished, reply with a concise markdown report: what you did, and the artifacts (file paths, commands, values) that later steps need. End the report with a final line: `STATUS: success` if the step's goal was achieved, or `STATUS: failure — <short reason>` if it was not (for example, tests you were asked to make pass still fail).",
 	);
 	return lines.join("\n");

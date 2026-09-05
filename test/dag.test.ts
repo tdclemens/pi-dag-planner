@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dependentsIndex, findCycle, getHardMaxSteps, getMaxSteps, topologicalLevels, validatePlan, DEFAULT_MAX_STEPS, HARD_MAX_STEPS } from "../src/dag.ts";
+import { dependentsIndex, findCycle, getHardMaxSteps, getMaxSteps, topologicalLevels, validatePlan, stepPromptWords, stepSizeWarnings, DEFAULT_MAX_STEPS, HARD_MAX_STEPS, STEP_PROMPT_TARGET_WORDS, STEP_PROMPT_WARN_WORDS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { DAG_PLAN_SCHEMA, validatePlanSchema } from "../src/schema.ts";
 import type { DagNode } from "../src/types.ts";
@@ -153,6 +153,46 @@ test("validatePlan: no touches declarations → no warnings (back-compat)", () =
 	assert.ok(v2.ok && (v2.warnings ?? []).length === 0);
 });
 
+// ---------------------------------------------------------------------------
+// Step-size warning (prompt word-count heuristic — granularity guardrail)
+// ---------------------------------------------------------------------------
+
+/** A node whose prompt is exactly `n` words. */
+function bigNode(id: string, n: number): DagNode {
+	const words = Array.from({ length: n }, (_, i) => `w${i}`).join(" ");
+	return { id, title: `Title ${id}`, prompt: words, dependsOn: [] };
+}
+
+test("stepPromptWords counts whitespace-separated words", () => {
+	assert.equal(stepPromptWords(""), 0);
+	assert.equal(stepPromptWords("   \n\t"), 0);
+	assert.equal(stepPromptWords("a b  c\n d"), 4);
+	assert.equal(stepPromptWords(bigNode("x", 250).prompt), 250);
+});
+
+test("stepSizeWarnings: one warning per oversized step, naming it and its count", () => {
+	const steps = [node("a"), bigNode("b", STEP_PROMPT_WARN_WORDS + 36), bigNode("c", 300)];
+	const warnings = stepSizeWarnings(steps);
+	assert.equal(warnings.length, 2);
+	assert.ok(warnings[0]!.includes('step "b" prompt is 236 words'));
+	assert.ok(warnings[1]!.includes('step "c" prompt is 300 words'));
+	assert.ok(warnings.every((w) => w.includes(`≤${STEP_PROMPT_TARGET_WORDS} words`) && w.includes("splitting it")));
+});
+
+test("stepSizeWarnings: exactly at the threshold is fine", () => {
+	assert.deepEqual(stepSizeWarnings([bigNode("a", STEP_PROMPT_WARN_WORDS)]), []);
+	assert.deepEqual(stepSizeWarnings([bigNode("a", STEP_PROMPT_WARN_WORDS - 1)]), []);
+});
+
+test("validatePlan reports size warnings but stays ok (non-fatal)", () => {
+	const v = validatePlan({ goal: "g", steps: [node("a"), bigNode("b", STEP_PROMPT_WARN_WORDS + 1)] });
+	assert.equal(v.ok, true, "oversized prompts must not fail the plan");
+	assert.ok(v.ok && v.warnings?.some((w) => /step "b" prompt is 201 words/.test(w)));
+	// healthy plans stay clean
+	const clean = validatePlan({ goal: "g", steps: [bigNode("a", 150), bigNode("b", 200)] });
+	assert.ok(clean.ok && (clean.warnings ?? []).length === 0);
+});
+
 test("validatePlan rejects duplicate ids", () => {
 	const v = validatePlan({ goal: "g", steps: [node("a"), node("a")] });
 	assert.equal(v.ok, false);
@@ -163,10 +203,10 @@ test("validatePlan rejects duplicate ids", () => {
 // Step-count caps: soft cap (planner guidance + warning) and hard ceiling
 // ---------------------------------------------------------------------------
 
-test("getMaxSteps reads the config soft cap (default 12)", () => {
+test("getMaxSteps reads the config soft cap (default 20)", () => {
 	assert.equal(getMaxSteps(), DEFAULT_MAX_STEPS);
-	assert.equal(getMaxSteps(), 12);
-	assert.equal(getMaxSteps({ ...DEFAULT_CONFIG, maxSteps: 20 }), 20);
+	assert.equal(getMaxSteps(), 20);
+	assert.equal(getMaxSteps({ ...DEFAULT_CONFIG, maxSteps: 30 }), 30);
 	for (const bad of [0, -3, 1.5]) {
 		assert.equal(getMaxSteps({ ...DEFAULT_CONFIG, maxSteps: bad }), DEFAULT_MAX_STEPS);
 	}
@@ -197,7 +237,7 @@ test("validatePlan warns (but stays ok) above the soft step cap", () => {
 	const v = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS + 1) });
 	assert.equal(v.ok, true);
 	assert.ok(
-		v.ok && v.warnings?.some((w) => /13 steps/.test(w) && /maxSteps/.test(w) && /agent session/.test(w)),
+		v.ok && v.warnings?.some((w) => /21 steps/.test(w) && /maxSteps/.test(w) && /agent session/.test(w)),
 	);
 	// exactly at the soft cap: no warning
 	const exact = validatePlan({ goal: "g", steps: chain(DEFAULT_MAX_STEPS) });

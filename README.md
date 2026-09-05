@@ -26,7 +26,7 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
 
 ## How it works
 
-1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `plannerExplore: false` in the config (see [Configuration](#configuration)) for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card. A `PLAN.md` in the project root is injected into the planner as project-specific planning instructions (see [Planning instructions (PLAN.md)](#planning-instructions-planmd)).
+1. **Plan** — your prompt is sent to your active model with a DAG-planner system prompt. By default the planner runs as a **read-only subagent** that first explores the repository (manifest, test/build commands, the files the request touches — ~10-15 tool calls, nothing is modified) so the plan cites real paths and exact commands; set `plannerExplore: false` in the config (see [Configuration](#configuration)) for the faster single-call blind planner. The model must respond with a single JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }` — `touches` declares the files and shared resources each step writes (see [Concurrent file conflicts](#concurrent-file-conflicts)). Each step prompt is self-contained because subagents have no shared context. **The JSON is validated automatically against the canonical JSON Schema** (`src/schema.ts`, draft 2020-12, via ajv) **and against the DAG rules — unique ids, known deps, and no cycles** — before anything continues; an invalid or cyclic plan is rejected and re-planned once with the error as feedback. Unordered `touches` overlap (implied serialization) is not rejected — it is shown as a ⚠ warning on the plan card. Step size is guarded the same way: the planner is instructed to keep each step to **one unit of work** (one file or one feature, prompt under ~150 words — oversized steps are where runs go wrong: context bloat, truncated final reports, hours-long retries), and any step whose prompt exceeds ~200 words gets a ⚠ "consider splitting" warning on the plan card before you execute. A `PLAN.md` in the project root is injected into the planner as project-specific planning instructions (see [Planning instructions (PLAN.md)](#planning-instructions-planmd)).
 2. **Review** — the plan is rendered as a friendly wave/dependency view in the chat (the raw JSON is the source of truth and appears when you expand the card with **Ctrl+O**). You choose:
    - **Execute plan**
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
@@ -71,7 +71,7 @@ Example `PLAN.md`:
 # Planning instructions for this repo
 
 - Always end the plan with a step that runs the full test suite and fixes failures until green.
-- Keep plans under 5 steps; prefer fewer, larger steps.
+- Prefer fine-grained steps: one file or one feature per step; split any step that bundles several features before approving it.
 - Never modify the database schema or the `vendor/` directory.
 ```
 
@@ -182,7 +182,7 @@ Example with all options and their defaults:
 
 ```json
 {
-  "maxSteps": 12,
+  "maxSteps": 20,
   "maxParallel": 4,
   "nodeRetries": 1,
   "plannerExplore": true,
@@ -193,7 +193,7 @@ Example with all options and their defaults:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `maxSteps` | integer ≥ 1 | `12` | Soft step-count cap: the planner sizes plans to it, and plans above it get a ⚠ on the plan card. |
+| `maxSteps` | integer ≥ 1 | `20` | Soft step-count cap: the planner sizes plans to it, and plans above it get a ⚠ on the plan card. |
 | `maxParallel` | integer ≥ 1 | `4` | Max concurrent runner subagents. |
 | `nodeRetries` | integer ≥ 0 | `1` | Auto-retries per node for transient failures (subprocess crash, model/API error, truncated or empty response). Agent-reported task failures are never auto-retried; `0` disables. |
 | `plannerExplore` | boolean | `true` | Planner explores the repo as a read-only subagent before planning. `false` = the faster single blind LLM call (no tools). |

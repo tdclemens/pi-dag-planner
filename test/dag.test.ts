@@ -174,7 +174,7 @@ test("stepSizeWarnings: one warning per oversized step, naming it and its count"
 	const steps = [node("a"), bigNode("b", STEP_PROMPT_WARN_WORDS + 36), bigNode("c", 300)];
 	const warnings = stepSizeWarnings(steps);
 	assert.equal(warnings.length, 2);
-	assert.ok(warnings[0]!.includes('step "b" prompt is 236 words'));
+	assert.ok(warnings[0]!.includes('step "b" prompt is 266 words'));
 	assert.ok(warnings[1]!.includes('step "c" prompt is 300 words'));
 	assert.ok(warnings.every((w) => w.includes(`≤${STEP_PROMPT_TARGET_WORDS} words`) && w.includes("splitting it")));
 });
@@ -187,7 +187,7 @@ test("stepSizeWarnings: exactly at the threshold is fine", () => {
 test("validatePlan reports size warnings but stays ok (non-fatal)", () => {
 	const v = validatePlan({ goal: "g", steps: [node("a"), bigNode("b", STEP_PROMPT_WARN_WORDS + 1)] });
 	assert.equal(v.ok, true, "oversized prompts must not fail the plan");
-	assert.ok(v.ok && v.warnings?.some((w) => /step "b" prompt is 201 words/.test(w)));
+	assert.ok(v.ok && v.warnings?.some((w) => /step "b" prompt is 231 words/.test(w)));
 	// healthy plans stay clean
 	const clean = validatePlan({ goal: "g", steps: [bigNode("a", 150), bigNode("b", 200)] });
 	assert.ok(clean.ok && (clean.warnings ?? []).length === 0);

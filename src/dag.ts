@@ -98,7 +98,7 @@ export function validatePlan(plan: unknown, config?: DagPlanConfig): PlanValidat
  * legitimately run long.
  */
 export const STEP_PROMPT_TARGET_WORDS = 150;
-export const STEP_PROMPT_WARN_WORDS = 200;
+export const STEP_PROMPT_WARN_WORDS = 230;
 
 /** Count words in a step prompt (whitespace-split, trimmed). */
 export function stepPromptWords(prompt: string): number {

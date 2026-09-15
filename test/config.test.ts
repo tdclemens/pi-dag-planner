@@ -27,6 +27,7 @@ test("parseConfig accepts valid values", () => {
 	const { config, warnings } = parseConfig({
 		maxSteps: 30,
 		maxParallel: 8,
+		parallel: false,
 		nodeRetries: 0,
 		plannerExplore: false,
 		plannerExtensions: ["/tmp/a.ts"],
@@ -34,6 +35,7 @@ test("parseConfig accepts valid values", () => {
 	});
 	assert.equal(config.maxSteps, 30);
 	assert.equal(config.maxParallel, 8);
+	assert.equal(config.parallel, false);
 	assert.equal(config.nodeRetries, 0);
 	assert.equal(config.plannerExplore, false);
 	assert.deepEqual(config.plannerExtensions, ["/tmp/a.ts"]);
@@ -45,6 +47,7 @@ test("parseConfig falls back per bad key and warns", () => {
 	const { config, warnings } = parseConfig({
 		maxSteps: "twelve",
 		maxParallel: 0,
+		parallel: "maybe",
 		nodeRetries: -1,
 		plannerExplore: "yes",
 		plannerExtensions: "/tmp/a.ts",
@@ -53,13 +56,15 @@ test("parseConfig falls back per bad key and warns", () => {
 	});
 	assert.equal(config.maxSteps, DEFAULT_CONFIG.maxSteps);
 	assert.equal(config.maxParallel, DEFAULT_CONFIG.maxParallel);
+	assert.equal(config.parallel, DEFAULT_CONFIG.parallel);
 	assert.equal(config.nodeRetries, DEFAULT_CONFIG.nodeRetries);
 	assert.equal(config.plannerExplore, DEFAULT_CONFIG.plannerExplore);
 	assert.deepEqual(config.plannerExtensions, []);
 	assert.deepEqual(config.runnerExtensions, ["/tmp/ok.ts"]);
-	assert.equal(warnings.length, 8);
+	assert.equal(warnings.length, 9);
 	assert.ok(warnings.some((w) => w.includes('"maxSteps"')));
 	assert.ok(warnings.some((w) => w.includes('"maxParallel"')));
+	assert.ok(warnings.some((w) => w.includes('"parallel"')));
 	assert.ok(warnings.some((w) => w.includes('"nodeRetries"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExplore"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExtensions"')));

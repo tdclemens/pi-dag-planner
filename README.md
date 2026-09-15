@@ -32,7 +32,7 @@ Plan saved: ~/.agents/plans/20250101-120000-add-unit-tests.md   (Ctrl+O: JSON)
    - **Refine** — give the planner feedback and re-plan (up to 3 rounds)
    - **Reject** — the plan file is kept for reference
 3. **Save** — before execution, the plan is written to `~/.agents/plans/<timestamp>-<slug>.md` with the human-readable step list and the exact JSON embedded.
-4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, set via `maxParallel` in the config) runs every node whose dependencies are complete, so independent branches execute concurrently. **Declared `touches` are mutex-protected at the scheduler**: a node holds its declared files/resources for the whole run, and a ready node whose touches collide with a running one stays pending (shown in the runner panel) until the holder finishes — no two nodes ever write the same declared file at the same time. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes, with the per-node file-lock extension (`src/lock-guard.ts`) injected via `-e` + `DAG_NODE_ID` to catch *undeclared* overlap at write time (see below). **Transient failures are auto-retried** (default 1, `nodeRetries` in the config): a crashed subprocess, model/API error, truncated final message, or empty response is re-run once with the failure reason fed back into the prompt (the retry is told to inspect the repo state first, since the failed attempt may have left partial changes). Each node's report must end with a status line (`STATUS: success` or `STATUS: failure — <reason>`); an explicit task failure is *not* auto-retried — the node is marked failed and its dependents skipped, and you can re-run it later with [resume](#resume).
+4. **Execute** — the executor re-validates the plan (schema + acyclicity) and refuses to start a cyclic or malformed plan. The DAG is then scheduled with Kahn's algorithm: a worker pool (default 4, set via `maxParallel` in the config) runs every node whose dependencies are complete, so independent branches execute concurrently — or set `parallel: false` to run strictly one node at a time. **Declared `touches` are mutex-protected at the scheduler**: a node holds its declared files/resources for the whole run, and a ready node whose touches collide with a running one stays pending (shown in the runner panel) until the holder finishes — no two nodes ever write the same declared file at the same time. Each node is a **subagent**: an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus (truncated) outputs of its prerequisite nodes, with the per-node file-lock extension (`src/lock-guard.ts`) injected via `-e` + `DAG_NODE_ID` to catch *undeclared* overlap at write time (see below). **Transient failures are auto-retried** (default 1, `nodeRetries` in the config): a crashed subprocess, model/API error, truncated final message, or empty response is re-run once with the failure reason fed back into the prompt (the retry is told to inspect the repo state first, since the failed attempt may have left partial changes). Each node's report must end with a status line (`STATUS: success` or `STATUS: failure — <reason>`); an explicit task failure is *not* auto-retried — the node is marked failed and its dependents skipped, and you can re-run it later with [resume](#resume).
 5. **Watch** — a live runner panel replaces the editor while the graph executes, showing per-node status and snippets of the commands the subagents run:
 
    ```
@@ -184,6 +184,7 @@ Example with all options and their defaults:
 {
   "maxSteps": 20,
   "maxParallel": 4,
+  "parallel": true,
   "nodeRetries": 1,
   "plannerExplore": true,
   "plannerExtensions": [],
@@ -195,6 +196,7 @@ Example with all options and their defaults:
 |-----|------|---------|-------------|
 | `maxSteps` | integer ≥ 1 | `20` | Soft step-count cap: the planner sizes plans to it, and plans above it get a ⚠ on the plan card. |
 | `maxParallel` | integer ≥ 1 | `4` | Max concurrent runner subagents. |
+| `parallel` | boolean | `true` | Run independent steps concurrently. `false` = sequential mode: at most one node at a time in DAG order (takes precedence over `maxParallel`). |
 | `nodeRetries` | integer ≥ 0 | `1` | Auto-retries per node for transient failures (subprocess crash, model/API error, truncated or empty response). Agent-reported task failures are never auto-retried; `0` disables. |
 | `plannerExplore` | boolean | `true` | Planner explores the repo as a read-only subagent before planning. `false` = the faster single blind LLM call (no tools). |
 | `plannerExtensions` | string[] | `[]` | Extra extensions loaded into the planner subagent (see below). |

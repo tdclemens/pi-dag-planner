@@ -11,6 +11,7 @@
  *   {
  *     "maxSteps": 20,            // soft step-count cap (planner guidance + plan-card warning)
  *     "maxParallel": 4,          // concurrent runner subagents
+ *     "parallel": true,          // false = run nodes strictly in sequence (one at a time)
  *     "nodeRetries": 1,          // auto-retries per node for transient failures (0 disables)
  *     "plannerExplore": true,    // planner explores the repo (read-only) before planning
  *     "plannerExtensions": [],   // extra extensions loaded into the planner subagent
@@ -39,6 +40,12 @@ export interface DagPlanConfig {
 	/** Max concurrent runner subagents. */
 	maxParallel: number;
 	/**
+	 * Run independent nodes concurrently. `false` = sequential mode: at most
+	 * one node at a time (DAG dependency order preserved); takes precedence
+	 * over `maxParallel`.
+	 */
+	parallel: boolean;
+	/**
 	 * Max auto-retries per node for transient failures (subprocess crash,
 	 * model/API error, output truncation, empty response). Agent-reported
 	 * task failures are never auto-retried. 0 disables auto-retry.
@@ -58,6 +65,7 @@ export interface DagPlanConfig {
 export const DEFAULT_CONFIG: DagPlanConfig = {
 	maxSteps: DEFAULT_MAX_STEPS,
 	maxParallel: DEFAULT_MAX_PARALLEL,
+	parallel: true,
 	nodeRetries: DEFAULT_NODE_RETRIES,
 	plannerExplore: true,
 	plannerExtensions: [],
@@ -143,6 +151,7 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 	const config: DagPlanConfig = {
 		maxSteps: DEFAULT_CONFIG.maxSteps,
 		maxParallel: DEFAULT_CONFIG.maxParallel,
+		parallel: DEFAULT_CONFIG.parallel,
 		nodeRetries: DEFAULT_CONFIG.nodeRetries,
 		plannerExplore: DEFAULT_CONFIG.plannerExplore,
 		plannerExtensions: [],
@@ -160,6 +169,13 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 				if (n !== undefined) config.maxParallel = n;
 				break;
 			}
+			case "parallel":
+				if (typeof value === "boolean") config.parallel = value;
+				else
+					warnings.push(
+						`"parallel" must be true or false (got ${describe(value)}) — using default ${DEFAULT_CONFIG.parallel}`,
+					);
+				break;
 			case "nodeRetries": {
 				const n = nonNegativeInt(value, key, warnings);
 				if (n !== undefined) config.nodeRetries = n;

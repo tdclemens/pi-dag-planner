@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import type { ChildProcess } from "node:child_process";
-import { buildTaskPrompt, getMaxParallel, getMaxRetries, parseStatusLine, runPiSubagent, runPlan } from "../src/executor.ts";
+import { buildTaskPrompt, getMaxParallel, getMaxRetries, isSequential, parseStatusLine, runPiSubagent, runPlan } from "../src/executor.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import type { DagEvent, DagNode, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
@@ -130,6 +130,13 @@ test("getMaxParallel reads the config cap (default 4)", () => {
 	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 7 }), 7);
 	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 0 }), 4);
 	assert.equal(getMaxParallel({ ...DEFAULT_CONFIG, maxParallel: 1.5 }), 4);
+});
+
+test("isSequential is true only when config parallel is false", () => {
+	assert.equal(isSequential(), false);
+	assert.equal(isSequential(DEFAULT_CONFIG), false);
+	assert.equal(isSequential({ ...DEFAULT_CONFIG, parallel: true }), false);
+	assert.equal(isSequential({ ...DEFAULT_CONFIG, parallel: false }), true);
 });
 
 test("runPlan executes independent nodes in parallel within the bound", async () => {
@@ -698,6 +705,15 @@ test("buildTaskPrompt enforces scope discipline (fail fast on oversized steps)",
 	assert.ok(prompt.indexOf("DAG file lock") < prompt.indexOf("Scope discipline"));
 });
 
+test("buildTaskPrompt adapts the concurrency note for sequential runs", () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const parallel = buildTaskPrompt(plan, plan.steps[0]!, new Map());
+	const sequential = buildTaskPrompt(plan, plan.steps[0]!, new Map(), undefined, undefined, true);
+	assert.ok(parallel.includes("may be running at the same time"));
+	assert.ok(!sequential.includes("may be running at the same time"));
+	assert.ok(sequential.includes("one at a time"));
+});
+
 test("runPlan passes the original request into every node prompt", async () => {
 	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2", ["s1"])] };
 	const h = makeHarness();
@@ -938,6 +954,22 @@ test("runPlan honors config maxParallel as the concurrency bound", async () => {
 		config: { ...DEFAULT_CONFIG, maxParallel: 2 },
 	});
 	assert.equal(h.maxActive, 2);
+});
+
+test("runPlan runs strictly sequentially when config parallel is false", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1"), node("s2"), node("s3"), node("s4"), node("s5")] };
+	const h = makeHarness();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		maxParallel: 5, // an explicit bound must not override sequential mode
+		spawnImpl: h.spawnImpl,
+		config: { ...DEFAULT_CONFIG, parallel: false, maxParallel: 5 },
+	});
+	assert.deepEqual(results.map((r) => r.id), ["s1", "s2", "s3", "s4", "s5"]);
+	assert.ok(results.every((r) => r.status === "done"));
+	assert.equal(h.spawns.length, 5);
+	assert.equal(h.maxActive, 1, "expected strictly one node at a time");
 });
 
 // --- resume (initialResults) -------------------------------------------------

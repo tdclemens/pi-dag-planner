@@ -39,6 +39,15 @@ export function getMaxParallel(config?: DagPlanConfig): number {
 	return DEFAULT_MAX_PARALLEL;
 }
 
+/**
+ * True when the run is sequential: config "parallel" is false. Sequential
+ * mode caps concurrency at 1 and takes precedence over `maxParallel` (option
+ * or config) — it is an explicit user setting, not just another bound.
+ */
+export function isSequential(config?: DagPlanConfig): boolean {
+	return config?.parallel === false;
+}
+
 /** Retry cap from config "nodeRetries" (defaults to DEFAULT_NODE_RETRIES). */
 export function getMaxRetries(config?: DagPlanConfig): number {
 	const n = config?.nodeRetries;
@@ -88,6 +97,8 @@ export function buildTaskPrompt(
 	originalPrompt?: string,
 	/** Previous-attempt failure reason for auto-retries (omitted on first attempt). */
 	retryNote?: string,
+	/** True when the run is sequential (config "parallel": false). */
+	sequential?: boolean,
 ): string {
 	const lines: string[] = [
 		"You are executing one node of a larger plan. Work autonomously and verify your own output.",
@@ -121,10 +132,20 @@ export function buildTaskPrompt(
 			"That attempt may have left partial changes in the repository. Inspect the current state first, keep what is correct, and complete the step from where it left off.",
 		);
 	}
+	if (sequential) {
+		lines.push(
+			"",
+			"Steps of this plan run strictly one at a time, so no other step is running concurrently in this repository.",
+			"",
+		);
+	} else {
+		lines.push(
+			"",
+			"Other steps of this plan may be running at the same time in this same repository. If a write or edit is rejected because the file changed since you last read it (DAG file lock), re-read the file and re-apply your change against the fresh content. If the same file keeps conflicting, do the rest of your task and report the conflict instead of retrying it.",
+			"",
+		);
+	}
 	lines.push(
-		"",
-		"Other steps of this plan may be running at the same time in this same repository. If a write or edit is rejected because the file changed since you last read it (DAG file lock), re-read the file and re-apply your change against the fresh content. If the same file keeps conflicting, do the rest of your task and report the conflict instead of retrying it.",
-		"",
 		"Scope discipline: if the step turns out substantially larger than its prompt describes, do not grind for hours. Stop once the repository is in a consistent, verified state (everything you finished still typechecks/tests green), and end with `STATUS: failure — <short reason> — remaining: <what is left>` so the plan can be re-scoped into smaller steps. A fast, honest failure beats a marathon session that truncates and has to be redone.",
 		"",
 		"When finished, reply with a concise markdown report: what you did, and the artifacts (file paths, commands, values) that later steps need. End the report with a final line: `STATUS: success` if the step's goal was achieved, or `STATUS: failure — <short reason>` if it was not (for example, tests you were asked to make pass still fail).",
@@ -174,7 +195,9 @@ export async function runPlan(plan: DagPlan, opts: RunPlanOptions): Promise<Node
 	if (!validation.ok) throw new Error(`refusing to execute plan: ${validation.error}`);
 
 	const steps = plan.steps;
-	const maxParallel = Math.max(1, opts.maxParallel ?? getMaxParallel(opts.config));
+	const maxParallel = isSequential(opts.config)
+		? 1
+		: Math.max(1, opts.maxParallel ?? getMaxParallel(opts.config));
 	const onEvent = opts.onEvent ?? (() => {});
 	const dependents = dependentsIndex(steps);
 
@@ -524,7 +547,7 @@ async function runNodeSubagent(
 		const r = results.get(d);
 		if (r && r.status === "done") depOutputs.set(d, r.output);
 	}
-	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt, retryNote);
+	const task = buildTaskPrompt(plan, node, depOutputs, opts.originalPrompt, retryNote, isSequential(opts.config));
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "-e", LOCK_GUARD_PATH];
 	// Configured extra extensions (resolved absolute paths from the config

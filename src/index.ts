@@ -9,8 +9,15 @@
  *             parallel pi subprocesses; each finished node appends a
  *             "dag-node" transcript entry.
  *   4. Persist: results appended to the plan file + summary message.
+ *
+ * /dag-compile reuses the same plan→gate→execute pipeline, driven by the
+ * uncommitted PRODUCT.md diff (compile.ts); `init` generates PRODUCT.md
+ * (empty for empty projects, otherwise via a hardcoded-system-prompt
+ * subagent) and commits it; `clean` reconciles the codebase against the
+ * ENTIRE spec (no diff, and removes nothing).
  */
 
+import { execFile } from "node:child_process";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -21,6 +28,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { runPlan } from "./executor.ts";
+import {
+	PRODUCT_MD,
+	buildCleanPrompt,
+	buildCompilePrompt,
+	commitProductMd,
+	loadProductMd,
+	generateProductMd,
+	getProductMdDiff,
+	loadCompileContext,
+	projectIsEmpty,
+} from "./compile.ts";
 import { loadConfig, type DagPlanConfig } from "./config.ts";
 import { normalizePlan, plan, plannerExplores, PlanError, planWithRetries, type PlanRetryFailure } from "./planner.ts";
 import * as plans from "./plans.ts";
@@ -65,6 +83,27 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("dag-compile", {
+		description:
+			"Compile the codebase toward PRODUCT.md: /dag-compile (uncommitted diff) · init (generate + commit PRODUCT.md) · clean (full spec, removes nothing)",
+		handler: async (args, ctx) => {
+			try {
+				const arg = args.trim();
+				if (arg.startsWith("init")) {
+					await runDagCompileInit(ctx);
+					return;
+				}
+				if (arg.startsWith("clean")) {
+					await runDagCompileCleanFlow(ctx);
+					return;
+				}
+				await runDagCompileFlow(ctx);
+			} catch (e) {
+				ctx.ui.notify(`dag-compile error: ${e instanceof Error ? e.message : String(e)}`, "error");
+			}
+		},
+	});
+
 	pi.registerMessageRenderer(PLAN_MESSAGE_TYPE, renderPlanMessage);
 	pi.registerMessageRenderer(SUMMARY_MESSAGE_TYPE, renderPlanSummary);
 	pi.registerEntryRenderer(NODE_ENTRY_TYPE, renderNodeCard);
@@ -85,10 +124,6 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		const modelLabel = `${model.provider}/${model.id}`;
-		// ctx.signal is undefined when the agent is not streaming; use a
-		// stand-in so the checks below are uniform (session_shutdown aborts
-		// the run via activeRun in that case).
-		const signal = ctx.signal ?? new AbortController().signal;
 
 		// Config: ~/.pi/agent/dag-plan.json plus .pi/dag-plan.json for trusted
 		// projects (project wins per key). Every option has a default, so a
@@ -104,22 +139,56 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			if (!prompt) return;
 		}
 
+		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		if (!gate) return;
+
+		// ------------------------------------------------------------------
+		// Phases 3+4: execute with the live dashboard, persist, summarize
+		// ------------------------------------------------------------------
+		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+	}
+
+	/**
+	 * Phases 1+2 (shared by /dag-plan and /dag-compile): draft the plan with
+	 * bounded retries behind a cancellable loader, then run the accept gate
+	 * (Execute / Refine ≤3 / Reject). Returns the accepted gate's result
+	 * (presentPlan's shape), or null when planning fails, the user
+	 * cancels/rejects, or the session aborts (failures are already
+	 * notified).
+	 */
+	async function planGateAndExecute(
+		ctx: ExtensionCommandContext,
+		modelLabel: string,
+		config: DagPlanConfig,
+		prompt: string,
+		startedAt: number,
+	): Promise<{
+		plan: PlannerResult["plan"];
+		planPath: string;
+		rawJson: string;
+		plannerUsage: PlannerResult["usage"];
+		planDurationMs: number;
+	} | null> {
+		// ctx.signal is undefined when the agent is not streaming; use a
+		// stand-in so the checks below are uniform (session_shutdown aborts
+		// the run via activeRun in that case).
+		const signal = ctx.signal ?? new AbortController().signal;
+
 		// ------------------------------------------------------------------
 		// Phase 1: plan (bounded retries on bad JSON / invalid plan; the
 		// failed attempt's raw output is fed back so the retry can see it)
 		// ------------------------------------------------------------------
-		const planStartedAt = Date.now();
 		const planOutcome = await planWithRetries((fb, prior) => planOnce(ctx, prompt, modelLabel, config, fb, prior), {
 			isAborted: () => signal.aborted,
 		});
 		if (!planOutcome.ok) {
 			if (!planOutcome.aborted) ctx.ui.notify(`Could not get a valid plan: ${planOutcome.error}`, "error");
-			return; // aborted (Esc / session) or retries exhausted
+			return null; // aborted (Esc / session) or retries exhausted
 		}
-		const planDurationMs = Date.now() - planStartedAt;
+		const planDurationMs = Date.now() - startedAt;
 
 		const current = await presentPlan(ctx, planOutcome.result, prompt, planDurationMs);
-		if (!current) return;
+		if (!current) return null;
 
 		// ------------------------------------------------------------------
 		// Phase 2: accept gate (Execute / Refine ≤3 / Reject)
@@ -127,7 +196,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		let refineAttempts = 0;
 		let gate = current;
 		while (true) {
-			if (signal.aborted) return;
+			if (signal.aborted) return null;
 			const options = ["Execute plan"];
 			if (refineAttempts < MAX_REFINE_ATTEMPTS) {
 				options.push(`Refine (${refineAttempts}/${MAX_REFINE_ATTEMPTS}) — re-plan with feedback`);
@@ -136,12 +205,12 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			const choice = await ctx.ui.select("DAG plan — what next?", options);
 			if (choice === undefined || choice === "Reject plan" || signal.aborted) {
 				ctx.ui.notify(`Plan rejected. Saved at ${shortenHome(gate.planPath)}`, "info");
-				return;
+				return null;
 			}
 			if (!choice.startsWith("Refine")) break; // Execute
 
 			const fb = await ctx.ui.input("Feedback for the planner", "e.g. split the refactor into smaller steps");
-			if (fb === undefined || signal.aborted) return;
+			if (fb === undefined || signal.aborted) return null;
 			refineAttempts++;
 
 			const rePlanStartedAt = Date.now();
@@ -152,17 +221,176 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			});
 			if (!reOutcome.ok) {
 				if (!reOutcome.aborted) ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
-				return;
+				return null;
 			}
 			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
-			if (!revised) return;
+			if (!revised) return null;
 			gate = revised;
 		}
 
-		// ------------------------------------------------------------------
-		// Phases 3+4: execute with the live dashboard, persist, summarize
-		// ------------------------------------------------------------------
+		return gate;
+	}
+
+	/**
+	 * /dag-compile init — generate PRODUCT.md in the current directory and
+	 * commit it. An empty project gets an empty PRODUCT.md (no model
+	 * needed); otherwise a read-only subagent with the hardcoded
+	 * productMdSystemPrompt explores the repo and drafts it (model
+	 * required, cancellable loader).
+	 */
+	async function runDagCompileInit(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify("/dag-compile requires the interactive TUI.", "error");
+			return;
+		}
+		if (!(await isGitWorkTree(ctx.cwd))) {
+			ctx.ui.notify("/dag-compile init requires a git repository in the current directory.", "error");
+			return;
+		}
+
+		let existing = "";
+		try {
+			existing = await fsp.readFile(path.resolve(ctx.cwd, PRODUCT_MD), "utf8");
+		} catch {
+			/* absent → generate it */
+		}
+		if (existing.trim() !== "") {
+			ctx.ui.notify("PRODUCT.md already exists — not overwriting it.", "info");
+			return;
+		}
+
+		const productMdPath = path.resolve(ctx.cwd, PRODUCT_MD);
+		if (projectIsEmpty(ctx.cwd)) {
+			await fsp.writeFile(productMdPath, "");
+		} else {
+			const model = ctx.model;
+			if (!model) {
+				ctx.ui.notify("No model selected (use /model).", "error");
+				return;
+			}
+			const content = await generateProductMdOnce(ctx, `${model.provider}/${model.id}`);
+			if (content === null) return; // aborted (Esc) or failed — already notified
+			await fsp.writeFile(productMdPath, content);
+		}
+
+		const commit = await commitProductMd(ctx.cwd);
+		if (!commit.ok) {
+			ctx.ui.notify(`Could not commit PRODUCT.md: ${commit.error}`, "error");
+			return;
+		}
+		ctx.ui.notify(`PRODUCT.md committed as ${commit.hash ?? "unknown"} — edit it, then run /dag-compile.`, "info");
+	}
+
+	/**
+	 * /dag-compile — plan + execute the changes that bring the codebase in
+	 * line with the uncommitted PRODUCT.md diff, informed by AGENTS.md /
+	 * CLAUDE.md / DESIGN.md where present. Same plan→gate→execute pipeline
+	 * as /dag-plan (planGateAndExecute + executePlan).
+	 */
+	async function runDagCompileFlow(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify("/dag-compile requires the interactive TUI.", "error");
+			return;
+		}
+		const model = ctx.model;
+		if (!model) {
+			ctx.ui.notify("No model selected (use /model).", "error");
+			return;
+		}
+		const modelLabel = `${model.provider}/${model.id}`;
+		const { config, warnings: configWarnings } = loadConfig(ctx.isProjectTrusted() ? ctx.cwd : undefined);
+		for (const w of configWarnings) ctx.ui.notify(`dag-compile config: ${w}`, "warning");
+
+		try {
+			await fsp.access(path.resolve(ctx.cwd, PRODUCT_MD));
+		} catch {
+			ctx.ui.notify("No PRODUCT.md in the current directory — run /dag-compile init first.", "error");
+			return;
+		}
+		const diff = await getProductMdDiff(ctx.cwd);
+		if (!diff) {
+			ctx.ui.notify("No uncommitted changes to PRODUCT.md — edit it and re-run /dag-compile.", "info");
+			return;
+		}
+
+		const prompt = buildCompilePrompt(diff, await loadCompileContext(ctx.cwd));
+		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		if (!gate) return;
 		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+	}
+
+	/**
+	 * /dag-compile clean — reconcile the codebase against the ENTIRE
+	 * PRODUCT.md, ignoring the git diff entirely (works even when the spec
+	 * is fully committed/unchanged, and in a non-git directory). One-way:
+	 * the plan only adds or fixes what the spec requires — it never
+	 * removes anything (buildCleanPrompt). Same plan→gate→execute pipeline
+	 * as /dag-plan.
+	 */
+	async function runDagCompileCleanFlow(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui" || !ctx.hasUI) {
+			ctx.ui.notify("/dag-compile requires the interactive TUI.", "error");
+			return;
+		}
+		const model = ctx.model;
+		if (!model) {
+			ctx.ui.notify("No model selected (use /model).", "error");
+			return;
+		}
+		const modelLabel = `${model.provider}/${model.id}`;
+		const { config, warnings: configWarnings } = loadConfig(ctx.isProjectTrusted() ? ctx.cwd : undefined);
+		for (const w of configWarnings) ctx.ui.notify(`dag-compile config: ${w}`, "warning");
+
+		const productMd = await loadProductMd(ctx.cwd);
+		if (productMd === null) {
+			ctx.ui.notify("No PRODUCT.md (or it is empty) in the current directory — run /dag-compile init first.", "error");
+			return;
+		}
+
+		const prompt = buildCleanPrompt(productMd, await loadCompileContext(ctx.cwd));
+		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		if (!gate) return;
+		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+	}
+
+	/** True when `cwd` is inside a git work tree (never throws). */
+	function isGitWorkTree(cwd: string): Promise<boolean> {
+		return new Promise((resolve) => {
+			execFile("git", ["rev-parse", "--is-inside-work-tree"], { cwd }, (err) => resolve(!err));
+		});
+	}
+
+	/**
+	 * PRODUCT.md generation behind a cancellable BorderedLoader (like
+	 * planOnce: tool activity renders inside the loader box). Returns the
+	 * generated markdown, or null when aborted (Esc) or the subagent failed
+	 * (the failure is notified here).
+	 */
+	function generateProductMdOnce(ctx: ExtensionCommandContext, modelLabel: string): Promise<string | null> {
+		return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+			const loader = new BorderedLoader(tui, theme, "Generating PRODUCT.md…", { cancellable: true });
+			const snippetLine = new Text("", 3, 0);
+			loader.children.splice(2, 0, snippetLine);
+			// Guard: Esc calls done(null) while the (killed) subagent may
+			// still settle the promise afterwards — done() must run exactly once.
+			let settled = false;
+			const finish = (outcome: string | null) => {
+				if (settled) return;
+				settled = true;
+				done(outcome);
+			};
+			loader.onAbort = () => finish(null);
+			generateProductMd(ctx.cwd, modelLabel, loader.signal, (snippet) => {
+				snippetLine.setText(theme.fg("muted", snippet));
+				tui.requestRender();
+			})
+				.then((r) => finish(r ? r.content : null))
+				.catch((e) => {
+					ctx.ui.notify(`Could not generate PRODUCT.md: ${e instanceof Error ? e.message : String(e)}`, "error");
+					finish(null);
+				});
+			return loader;
+		});
 	}
 
 	/**

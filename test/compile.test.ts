@@ -309,6 +309,7 @@ test("buildCompilePrompt embeds the goal, diff, and each context label", () => {
 	assert.ok(p.includes("## DESIGN.md\nnotes"), "DESIGN.md label present");
 	assert.match(p, /end green/);
 	assert.match(p, /verification command/);
+	assert.match(p, /\"steps\": \[\]/, "no-op plan offered when the diff needs no changes");
 });
 
 test("buildCompilePrompt omits the context part when none exist", () => {
@@ -331,6 +332,10 @@ test("buildCleanPrompt embeds the whole-spec goal, full spec, and each context l
 	assert.ok(p.includes("## DESIGN.md\nnotes"), "DESIGN.md label present");
 	assert.match(p, /end green/);
 	assert.match(p, /verification command/);
+	assert.match(p, /Features section is the contract/i, "Features = what the code must implement");
+	assert.match(p, /Goals is product direction, not a work order/i, "Goals never planned as work");
+	assert.match(p, /backlog/i, "proposals/backlog items are out of scope");
+	assert.match(p, /\"steps\": \[\]/, "no-op plan offered when the code already matches");
 });
 
 test("buildCleanPrompt omits the context part when none exist", () => {

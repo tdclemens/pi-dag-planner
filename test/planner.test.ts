@@ -113,9 +113,30 @@ test("normalizePlan rejects non-plan shapes", () => {
 	assert.equal(normalizePlan("G"), null);
 });
 
+test("normalizePlan accepts an empty steps array as a no-op plan", () => {
+	const p = normalizePlan({ goal: "Already in line", steps: [] });
+	assert.ok(p, "empty steps is a valid plan shape");
+	assert.equal(p!.goal, "Already in line");
+	assert.deepEqual(p!.steps, []);
+});
+
 test("extractPlanJson throws a diagnostic for garbage output", () => {
 	assert.throws(() => extractPlanJson("I cannot produce JSON right now."), /not a valid plan/);
 	assert.throws(() => extractPlanJson('{"unrelated": true}'), /not a valid plan/);
+});
+
+test("extractPlanJson parses a no-op plan (empty steps)", () => {
+	const { plan, json } = extractPlanJson('{"goal": "Nothing to do", "steps": []}');
+	assert.equal(plan.goal, "Nothing to do");
+	assert.deepEqual(plan.steps, []);
+	assert.deepEqual(JSON.parse(json), plan);
+});
+
+test("extractPlanJson names plan-shape rejections instead of blaming missing JSON", () => {
+	// JSON parsed fine but is not plan-shaped: the diagnostic must say so
+	// (the old \"no JSON object found in output\" forced a retry that invented steps).
+	assert.throws(() => extractPlanJson('{"unrelated": true}'), /not plan-shaped/);
+	assert.throws(() => extractPlanJson('{"unrelated": true}'), (e: Error) => !/no JSON object found/.test(e.message));
 });
 
 // ---------------------------------------------------------------------------
@@ -254,6 +275,21 @@ test("planner prompts enforce fine-grained steps (one unit of work per step)", (
 	const agentic = plannerSystemPrompt(12);
 	assert.match(agentic, /decompose before writing any JSON/i);
 	assert.match(agentic, /end green/i, "each step must end in a verified state");
+});
+
+test("planner prompts allow a no-op plan (empty steps) instead of invented work", () => {
+	for (const p of [plannerSystemPrompt(12), blindPlannerPrompt(12)]) {
+		assert.match(p, /no-op/i);
+		assert.match(p, /\"steps\": \[\]/, "empty steps array named as the no-op answer");
+		assert.match(p, /never invent steps/i, "no padding steps when there is nothing to do");
+	}
+});
+
+test("planner prompts bound PLAN.md to how-to-plan, never what-to-plan", () => {
+	for (const prompt of [plannerSystemPrompt(12), blindPlannerPrompt(12)]) {
+		assert.match(prompt, /never what to plan/i);
+		assert.match(prompt, /backlog items in it are not work to add/i);
+	}
 });
 
 test("plannerExplores reads the config flag (on by default)", () => {
@@ -603,6 +639,7 @@ test("plan() injects PLAN.md into the exploring planner prompt before the task w
 				assert.ok(prompt.startsWith("Project planning instructions (from PLAN.md):"), "instructions come first");
 				assert.ok(prompt.includes(planMd), "PLAN.md content present");
 				assert.match(prompt, /planning-only instructions/i, "note about planner-only visibility");
+				assert.match(prompt, /never what to plan/i, "PLAN.md bounds how, not what, to plan");
 				assert.ok(
 					prompt.indexOf("Project planning instructions") < prompt.indexOf("Plan this task:"),
 					"instructions precede the task",

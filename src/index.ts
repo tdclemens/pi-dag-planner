@@ -63,6 +63,11 @@ const NODE_ENTRY_TYPE = "dag-node";
 const MAX_REFINE_ATTEMPTS = 3;
 const STATUS_KEY = "dag-runner";
 
+/** True for a no-op plan (empty steps): nothing to save, gate, or run. */
+function isNoOpPlan(plan: DagPlan): boolean {
+	return plan.steps.length === 0;
+}
+
 export default function dagPlanExtension(pi: ExtensionAPI): void {
 	let activeRun: { abort: () => void } | undefined;
 
@@ -153,8 +158,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	 * bounded retries behind a cancellable loader, then run the accept gate
 	 * (Execute / Refine ≤3 / Reject). Returns the accepted gate's result
 	 * (presentPlan's shape), or null when planning fails, the user
-	 * cancels/rejects, or the session aborts (failures are already
-	 * notified).
+	 * cancels/rejects, the session aborts, or the plan is a no-op (empty
+	 * steps — nothing to do; already notified). Failures are already
+	 * notified.
 	 */
 	async function planGateAndExecute(
 		ctx: ExtensionCommandContext,
@@ -186,6 +192,11 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			return null; // aborted (Esc / session) or retries exhausted
 		}
 		const planDurationMs = Date.now() - startedAt;
+
+		if (isNoOpPlan(planOutcome.result.plan)) {
+			ctx.ui.notify(`No-op plan — ${planOutcome.result.plan.goal} Nothing to do; no plan file saved.`, "info");
+			return null;
+		}
 
 		const current = await presentPlan(ctx, planOutcome.result, prompt, planDurationMs);
 		if (!current) return null;
@@ -221,6 +232,10 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			});
 			if (!reOutcome.ok) {
 				if (!reOutcome.aborted) ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
+				return null;
+			}
+			if (isNoOpPlan(reOutcome.result.plan)) {
+				ctx.ui.notify(`No-op plan — ${reOutcome.result.plan.goal} Nothing to do; no plan file saved.`, "info");
 				return null;
 			}
 			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
@@ -324,8 +339,11 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	 * PRODUCT.md, ignoring the git diff entirely (works even when the spec
 	 * is fully committed/unchanged, and in a non-git directory). One-way:
 	 * the plan only adds or fixes what the spec requires — it never
-	 * removes anything (buildCleanPrompt). Same plan→gate→execute pipeline
-	 * as /dag-plan.
+	 * removes anything (buildCleanPrompt). Scope is the spec's Features,
+	 * not proposals or backlogs in PLAN.md. When the code already
+	 * matches, the planner returns a no-op plan (empty steps): the flow
+	 * reports it and saves nothing. Same plan→gate→execute pipeline as
+	 * /dag-plan.
 	 */
 	async function runDagCompileCleanFlow(ctx: ExtensionCommandContext): Promise<void> {
 		if (ctx.mode !== "tui" || !ctx.hasUI) {

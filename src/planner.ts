@@ -69,12 +69,13 @@ Rules:
 - Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Exception: steps that modify the same file or resource MUST be ordered with an edge — parallel steps must touch disjoint files.
 - "touches" is required for every step that creates or modifies anything: list the exact file paths (relative to the repo root) the step will write, plus the shared resources its commands mutate. npm/pnpm install → include "package-lock.json" and "node_modules"; a formatter → the files it rewrites; a dev server or test database → a named resource like "ports:3000" or "test-db". Read-only steps use []. Steps whose touches overlap are hard-serialized by the executor; when two steps must touch the same file, add a dependsOn edge so the order is explicit in the plan (and still list the overlap in touches).
 - Each "prompt" must be self-contained — subagents share NO conversation context and do NOT see this planning session (they see the one-line goal, the user's original request, their step prompt, and the final reports of their prerequisite steps, truncated to ~8KB each). State the goal, the concrete task, the exact file paths and commands (use the ones you verified during exploration), the expected artifacts, and end with an explicit report instruction: "Report: <the exact artifacts — file paths, commands, values> later steps need." A step's final message is the only thing its dependents receive.
-- Complete coverage: every part of the user's request must be produced or addressed by at least one step; after the last step the repository must satisfy the request as a whole. Do not silently drop requirements.
+- Complete coverage: every part of the user's request that requires a change must be produced or addressed by at least one step; after the last step the repository must satisfy the request as a whole. Do not silently drop requirements.
+- No-op plans: when the request requires NO changes (e.g. a spec reconciliation where the codebase already matches), the correct plan is empty: {"goal": "…", "steps": []}. That no-op plan is valid and complete — never invent steps to fill it (no \"verify nothing changed\", \"re-check the code\", or status-report steps).
 - Verification is required: if any step changes code, config, or files, the plan must end with a verification step that runs the project's real checks (the exact test/build/typecheck commands you found during exploration) and fixes any failures it causes until green; if the project has no checks, it must instead run a meaningful smoke check (start the app, run the CLI, or import the module) and report the observed output.
 - Prefer direct action over research steps: you already explored the repo. Include an execution-time discovery step only for what you could not determine statically (e.g. runtime behavior, a flaky-test baseline).
 - No git mutations (commits, pushes, branches) or destructive operations unless the user's request explicitly requires them; if a commit is required, make it a single final step after all edits.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
-- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan.`;
+- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan — how to plan (conventions, step size, definitions of done), never what to plan: proposals or backlog items in it are not work to add unless the task itself asks for them.`;
 }
 
 /** Fallback prompt for the blind single-call planner (no tools). */
@@ -84,6 +85,8 @@ export function blindPlannerPrompt(maxSteps: number): string {
 One unit of work per step: usually one new file, or one tightly-coupled file plus its tests, and at most one feature. A step that creates 2+ substantial files or implements 2+ distinct features is too big — split it into separate steps linked by dependsOn. Prefer more, smaller steps over fewer, larger ones (independent steps run in parallel, so finer granularity rarely costs wall-clock). Keep each step prompt under ~150 words, ending with the exact command that verifies the step.
 
 Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Each "prompt" must be self-contained — subagents share NO conversation context: state the goal, the concrete task, relevant file paths and commands, expected artifacts, and how to report results.
+
+No-op: if the request requires no changes, respond with an empty steps array ({"goal": "…", "steps": []}) — that plan is valid and complete; never invent steps to fill it.
 
 Respond with ONLY a JSON object — no prose, no markdown fences — matching exactly:
 {
@@ -106,7 +109,7 @@ Rules:
 - "touches" (required for steps that modify anything): the exact file paths the step creates or modifies, plus shared resources its commands mutate (lockfiles, build dirs, ports); read-only steps use []. Overlapping touches are serialized at run time — keep them disjoint or order the steps with dependsOn.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
 - The last step(s) should verify the work (run tests, build, or report findings).
-- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan.`;
+- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan — how to plan, never what to plan: proposals or backlog items in it are not work to add unless the task itself asks for them.`;
 }
 
 /** Read-only tools the exploring planner is allowed to use. */
@@ -212,6 +215,8 @@ export function extractPlanJson(text: string): ExtractedPlan {
 		}
 		const plan = normalizePlan(parsed);
 		if (plan) return { plan, json: JSON.stringify(plan, null, 2) };
+		lastError =
+			"parsed JSON is not plan-shaped (needs a non-blank \"goal\" string and a \"steps\" array of step objects, each with a non-blank \"prompt\" string)";
 	}
 	throw new Error(`planner output is not a valid plan JSON (${lastError})`);
 }
@@ -221,7 +226,7 @@ export function normalizePlan(value: unknown): DagPlan | null {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
 	const v = value as Record<string, unknown>;
 	if (typeof v.goal !== "string" || !v.goal.trim()) return null;
-	if (!Array.isArray(v.steps) || v.steps.length === 0) return null;
+	if (!Array.isArray(v.steps)) return null;
 
 	const steps: DagNode[] = [];
 	for (const raw of v.steps) {
@@ -342,7 +347,7 @@ export async function plan(
 	const planMd = await loadPlannerInstructions(ctx.cwd);
 	if (planMd)
 		parts.push(
-			`Project planning instructions (from PLAN.md):\n${planMd}\nThese are planning-only instructions: follow them when shaping the plan; they are not visible to the executing subagents.`,
+			`Project planning instructions (from PLAN.md):\n${planMd}\nThese are planning-only instructions: follow them when shaping the plan; they are not visible to the executing subagents. They guide HOW to plan (conventions, step size, definitions of done) — never what to plan: a proposal, idea, or backlog item in PLAN.md is not work to add to the plan unless the task itself asks for it.`,
 		);
 	parts.push(`Plan this task:\n\n${prompt}`);
 	if (opts.priorPlanJson)

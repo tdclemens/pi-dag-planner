@@ -13,8 +13,9 @@
  * /dag-compile reuses the same plan→gate→execute pipeline, driven by the
  * uncommitted PRODUCT.md diff (compile.ts); `init` generates PRODUCT.md
  * (empty for empty projects, otherwise via a hardcoded-system-prompt
- * subagent) and commits it; `clean` reconciles the codebase against the
- * ENTIRE spec (no diff, and removes nothing).
+ * subagent) — the user commits the baseline themselves; `clean`
+ * reconciles the codebase against the ENTIRE spec (no diff, and removes
+ * nothing).
  */
 
 import { execFile } from "node:child_process";
@@ -32,7 +33,6 @@ import {
 	PRODUCT_MD,
 	buildCleanPrompt,
 	buildCompilePrompt,
-	commitProductMd,
 	loadProductMd,
 	generateProductMd,
 	getProductMdDiff,
@@ -90,7 +90,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("dag-compile", {
 		description:
-			"Compile the codebase toward PRODUCT.md: /dag-compile (uncommitted diff) · init (generate + commit PRODUCT.md) · clean (full spec, removes nothing)",
+			"Compile the codebase toward PRODUCT.md: /dag-compile (uncommitted diff) · init (generate PRODUCT.md) · clean (full spec, removes nothing)",
 		handler: async (args, ctx) => {
 			try {
 				const arg = args.trim();
@@ -247,9 +247,10 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * /dag-compile init — generate PRODUCT.md in the current directory and
-	 * commit it. An empty project gets an empty PRODUCT.md (no model
-	 * needed); otherwise a read-only subagent with the hardcoded
+	 * /dag-compile init — generate PRODUCT.md in the current directory
+	 * (written, not committed — the user commits the baseline themselves).
+	 * An empty project gets an empty PRODUCT.md (no model needed);
+	 * otherwise a read-only subagent with the hardcoded
 	 * productMdSystemPrompt explores the repo and drafts it (model
 	 * required, cancellable loader).
 	 */
@@ -288,12 +289,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			await fsp.writeFile(productMdPath, content);
 		}
 
-		const commit = await commitProductMd(ctx.cwd);
-		if (!commit.ok) {
-			ctx.ui.notify(`Could not commit PRODUCT.md: ${commit.error}`, "error");
-			return;
-		}
-		ctx.ui.notify(`PRODUCT.md committed as ${commit.hash ?? "unknown"} — edit it, then run /dag-compile.`, "info");
+		ctx.ui.notify("PRODUCT.md written — commit it, edit it, then run /dag-compile.", "info");
 	}
 
 	/**

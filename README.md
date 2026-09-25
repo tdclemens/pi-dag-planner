@@ -44,13 +44,13 @@ The compile is **informed by the standard markdown files in the project root**: 
 /dag-compile init
 ```
 
-Generates `PRODUCT.md` in the current directory and **commits it** (`git add` + `git commit -m "Add PRODUCT.md"`). The commit matters: the compile diffs against the committed baseline, so `init` is what makes the first `/dag-compile` possible.
+Generates `PRODUCT.md` in the current directory — **not committed**: you commit the baseline yourself. The commit matters: the compile diffs against the committed baseline, so committing the generated `PRODUCT.md` is what makes the first `/dag-compile` possible.
 
-- **Empty project** (only dotfiles — no visible files or directories) → an **empty** `PRODUCT.md` is written and committed. No model is needed.
-- **Non-empty project** → the **active model** (`/model`) generates the file via a **hardcoded system prompt**: a **read-only** subagent (`read`/`grep`/`find`/`ls` only, no extensions/skills/context files) first **explores the repository** (~10-15 tool calls — manifest, README, entry points; live in the loader, like the `/dag-plan` planner) and then replies with only the raw markdown: a title + one-paragraph overview, `## Features` (what the code actually implements), `## Goals`, and `## Constraints`.
+- **Empty project** (only dotfiles — no visible files or directories) → an **empty** `PRODUCT.md` is written. No model is needed.
+- **Non-empty project** → the **active model** (`/model`) generates the file via a **hardcoded system prompt**: a **read-only** subagent (`read`/`grep`/`find`/`ls` only, no extensions/skills/context files) first **explores the repository** (~10-15 tool calls — manifest, README, entry points; live in the loader, like the `/dag-plan` planner) and then replies with only the raw markdown: a title + short overview, then `## Features`, `## Goals`, and `## Constraints`. The prompt enforces a concise, human-readable result: short plain sentences, one-fact bullets, no asides or filler, and only what the repo shows.
 - An existing non-empty `PRODUCT.md` is **never overwritten** — you edit it by hand, and the resulting diff is what the next `/dag-compile` compiles.
 
-The intended loop: `init` (baseline spec) → **edit `PRODUCT.md`** to describe what the product should be → `/dag-compile` (the codebase catches up) → commit the spec and the code.
+The intended loop: `init` (baseline spec) → **commit `PRODUCT.md`** (the baseline) → **edit `PRODUCT.md`** to describe what the product should be → `/dag-compile` (the codebase catches up) → commit the spec and the code.
 
 ### /dag-compile clean
 
@@ -60,7 +60,7 @@ The intended loop: `init` (baseline spec) → **edit `PRODUCT.md`** to describe 
 
 Runs the same pipeline against the **entire** `PRODUCT.md` instead of its diff — **no git diff is read at all**, so it works even when the spec is fully committed and unmodified (and even outside a git repository, since the spec is just read from disk). It is a **one-way reconciliation**: the plan only **adds** what the spec requires but the code lacks and **fixes** what the code gets wrong against the spec; **unlike a conventional clean, it removes nothing** — code or features the spec does not mention stay in place. **Scope is the spec's Features section** — Goals is product direction, not a work order, and proposals or backlog items (e.g. in `PLAN.md`) are never planned as work. Use it to re-assert the spec after a stretch of drifting hand-edits; if the code already matches, the planner returns a **no-op plan** (`"steps": []`) and the command reports it — no plan file is saved, nothing runs. Any non-empty plan still goes through the same review gate before anything runs.
 
-**Notes.** All forms need the usual TUI + model requirements. `init` requires a **git repository** in the current directory (it commits the baseline). The diff-based compile needs a **committed `PRODUCT.md` baseline** — `init` provides it — and **uncommitted changes** to it; a file that is merely present but untouched has nothing to compile toward. `clean` needs only a **non-empty `PRODUCT.md`** — it reads no diff.
+**Notes.** All forms need the usual TUI + model requirements. `init` requires a **git repository** in the current directory (you must be able to commit the baseline it writes). The diff-based compile needs a **committed `PRODUCT.md` baseline** — commit the file `init` writes — and **uncommitted changes** to it; a file that is merely present but untouched has nothing to compile toward. `clean` needs only a **non-empty `PRODUCT.md`** — it reads no diff.
 
 ## How it works
 

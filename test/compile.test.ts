@@ -10,7 +10,6 @@ import {
 	buildCleanPrompt,
 	buildCompilePrompt,
 	buildProductMdArgs,
-	commitProductMd,
 	generateProductMd,
 	getProductMdDiff,
 	loadCompileContext,
@@ -345,52 +344,6 @@ test("buildCleanPrompt omits the context part when none exist", () => {
 });
 
 // ---------------------------------------------------------------------------
-// commitProductMd
-// ---------------------------------------------------------------------------
-
-test("commitProductMd adds and commits PRODUCT.md and reports the short hash", async () => {
-	const { dir, cleanup } = tempCwd();
-	try {
-		newRepo(dir);
-		writeFileSync(join(dir, PRODUCT_MD), "# P\n");
-		const r = await commitProductMd(dir);
-		assert.equal(r.ok, true, "commit succeeds");
-		assert.match(r.ok ? r.hash! : "", /^[0-9a-f]{7,}$/);
-		assert.equal(git(dir, "log", "-1", "--pretty=%s").trim(), "Add PRODUCT.md");
-		assert.equal(git(dir, "show", "--stat", "--name-only", "--pretty=", "HEAD").trim(), "PRODUCT.md");
-		assert.equal(git(dir, "show", "HEAD:PRODUCT.md").trim(), "# P", "git show HEAD:PRODUCT.md succeeds");
-	} finally {
-		cleanup();
-	}
-});
-
-test("commitProductMd reports an error when there is nothing to commit", async () => {
-	const { dir, cleanup } = tempCwd();
-	try {
-		newRepo(dir);
-		writeFileSync(join(dir, PRODUCT_MD), "# P\n");
-		await commitProductMd(dir);
-		const r2 = await commitProductMd(dir);
-		assert.equal(r2.ok, false);
-		assert.ok(!r2.ok && r2.error.length > 0, "error message present");
-	} finally {
-		cleanup();
-	}
-});
-
-test("commitProductMd never throws outside a git repo", async () => {
-	const { dir, cleanup } = tempCwd();
-	try {
-		writeFileSync(join(dir, PRODUCT_MD), "# P\n");
-		const r = await commitProductMd(dir);
-		assert.equal(r.ok, false, "non-repo → ok:false");
-		assert.ok(!r.ok && r.error.length > 0);
-	} finally {
-		cleanup();
-	}
-});
-
-// ---------------------------------------------------------------------------
 // productMdSystemPrompt / buildProductMdArgs / generateProductMd
 // ---------------------------------------------------------------------------
 
@@ -400,6 +353,13 @@ test("productMdSystemPrompt describes the read-only PRODUCT.md writer contract",
 	assert.ok(sp.includes("ONLY the raw markdown"), "raw markdown only");
 	for (const section of ["## Features", "## Goals", "## Constraints"]) assert.ok(sp.includes(section), section);
 	assert.ok(sp.includes("PRODUCT.md"));
+	// Style contract: concise, human-readable, no asides, to the point.
+	assert.ok(sp.includes("No asides"), "bans asides (parentheses, callouts, meta commentary)");
+	assert.ok(sp.includes("One fact per bullet"), "one fact per bullet");
+	assert.ok(sp.includes("short plain sentences"), "human-readable plain language");
+	assert.ok(sp.includes("never invent"), "repo evidence only");
+	assert.ok(sp.includes("at most 3 sentences"), "concise overview bound");
+	assert.ok(sp.includes("No front matter, no code fences"), "plain markdown only");
 });
 
 test("buildProductMdArgs emits the exact pi flag list", () => {

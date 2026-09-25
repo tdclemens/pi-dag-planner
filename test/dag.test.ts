@@ -21,11 +21,12 @@ test("validatePlan accepts a valid plan", () => {
 	assert.equal(v.ok, true);
 });
 
-test("validatePlan rejects missing goal / empty steps", () => {
+test("validatePlan rejects a missing goal (but accepts an empty no-op plan)", () => {
 	assert.equal(validatePlan({ steps: diamond }).ok, false);
 	assert.equal(validatePlan({ goal: "g" }).ok, false);
-	assert.equal(validatePlan({ goal: "g", steps: [] }).ok, false);
 	assert.equal(validatePlan(null).ok, false);
+	// An empty steps array is a valid no-op plan: the task requires no changes.
+	assert.equal(validatePlan({ goal: "g", steps: [] }).ok, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ test("DAG_PLAN_SCHEMA is a 2020-12 schema for the plan contract", () => {
 	const stepItem = steps.items;
 	assert.deepEqual(DAG_PLAN_SCHEMA.required, ["goal", "steps"]);
 	assert.deepEqual((DAG_PLAN_SCHEMA.properties as any).goal.type, "string");
-	assert.equal(steps.minItems, 1);
+	assert.equal(steps.minItems, undefined, "no minItems: an empty steps array is a valid no-op plan");
 	assert.deepEqual([...stepItem.required].sort(), ["dependsOn", "id", "prompt", "title"]);
 	assert.equal(stepItem.properties.id.pattern, "^[a-zA-Z0-9_-]{1,64}$");
 	assert.ok(stepItem.properties.dependsOn.uniqueItems);
@@ -60,7 +61,6 @@ test("validatePlanSchema rejects malformed plans with readable diagnostics", () 
 		[{ steps: diamond }, /goal is required/],
 		[{ goal: 42, steps: diamond }, /goal must be a string/],
 		[{ goal: "g" }, /steps is required/],
-		[{ goal: "g", steps: [] }, /steps must be a non-empty array/],
 		[{ goal: "g", steps: [node("a"), node("b")], extra: 1 }, /unknown property "extra"/],
 		[{ goal: "g", steps: [{ ...node("a"), extra: 1 }] }, /unknown property "extra"/],
 		[{ goal: "g", steps: [{ ...node("a"), id: "bad id" }] }, /must match/],

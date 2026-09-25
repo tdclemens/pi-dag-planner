@@ -221,7 +221,9 @@ export async function loadCompileContext(cwd: string): Promise<string[]> {
  * in line with the PRODUCT.md changes; PRODUCT.md is the source of truth
  * for product intent), the uncommitted PRODUCT.md diff, each context
  * section, and the end-green requirement (every step names the exact
- * verification command that must pass).
+ * verification command that must pass). The codebase may already satisfy
+ * the diff: the prompt offers the empty no-op plan for that case instead
+ * of forcing the planner to invent work.
  */
 export function buildCompilePrompt(diff: string, contextParts: string[]): string {
 	const parts: string[] = [
@@ -238,7 +240,7 @@ ${diff}
 ${contextParts.join("\n\n")}`);
 	}
 	parts.push(
-		"Plan the changes needed to make the code match the spec above. Every step must end green: its prompt names the exact verification command (the project's real typecheck/test/build command) and the step is done only when that command passes.",
+		"Plan the changes needed to make the code match the spec above. If the codebase already satisfies the diff (no changes needed), there is nothing to do — respond with an EMPTY steps array (\"steps\": []); that no-op plan is valid, so never invent steps to fill it. Every step must end green: its prompt names the exact verification command (the project's real typecheck/test/build command) and the step is done only when that command passes.",
 	);
 	return parts.join("\n\n");
 }
@@ -248,7 +250,10 @@ ${contextParts.join("\n\n")}`);
  * codebase against the ENTIRE PRODUCT.md (no diff — works even when the
  * spec is fully committed/unchanged). One-way: the plan adds or fixes
  * what the spec requires but REMOVES NOTHING — code or features the spec
- * does not mention stay in place.
+ * does not mention stay in place. Scope is bounded: the spec's Features
+ * section is the contract; Goals is direction, not a work order, and
+ * proposals/backlog items (e.g. in PLAN.md) are not work to plan. When
+ * the code already matches, the correct answer is the empty no-op plan.
  */
 export function buildCleanPrompt(productMd: string, contextParts: string[]): string {
 	const parts: string[] = [
@@ -267,7 +272,7 @@ ${productMd}
 ${contextParts.join("\n\n")}`);
 	}
 	parts.push(
-		"Plan the changes needed to make the code match the spec above, without removing anything. Every step must end green: its prompt names the exact verification command (the project's real typecheck/test/build command) and the step is done only when that command passes.",
+		"Scope: the spec's Features section is the contract — the code must implement it. Goals is product direction, not a work order, and Constraints are rules to respect: never plan work the spec merely proposes or lists as future, backlog, or ideas (including proposals or backlog items in PLAN.md or other context files).\n\nPlan the changes needed to make the code match the spec above, without removing anything. If the codebase already fully matches the spec, there is nothing to do — respond with an EMPTY steps array (\"steps\": []); that no-op plan is valid, so never invent steps to fill it. Every step must end green: its prompt names the exact verification command (the project's real typecheck/test/build command) and the step is done only when that command passes.",
 	);
 	return parts.join("\n\n");
 }

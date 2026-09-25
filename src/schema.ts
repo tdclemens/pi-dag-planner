@@ -40,8 +40,8 @@ export const DAG_PLAN_SCHEMA: SchemaObject = {
 		},
 		steps: {
 			type: "array",
-			minItems: 1,
-			description: "Step definitions; dependsOn edges must form a DAG (checked in dag.ts).",
+			description:
+				"Step definitions; dependsOn edges must form a DAG (checked in dag.ts). An empty array is a valid no-op plan (the task requires no changes).",
 			items: {
 				type: "object",
 				required: ["id", "title", "prompt", "dependsOn"],
@@ -131,7 +131,7 @@ function formatSchemaError(errors: ErrorObject[] | null | undefined): string {
 			return `${path} must be a non-blank string`;
 		}
 		case "minItems":
-			return path === "steps" ? "steps must be a non-empty array" : `${path} must have at least 1 item`;
+			return `${path} must have at least 1 item`;
 		case "uniqueItems":
 			return `${path} must not contain duplicates`;
 		case "additionalProperties": {

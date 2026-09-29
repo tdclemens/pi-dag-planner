@@ -9,6 +9,7 @@ Prompt examples for the `/dag-plan` command. Each subdirectory contains a `promp
 | [markdown-blog](./markdown-blog/prompt.md) | Rails 8 blog app rendering Markdown posts | wide fan-out (content, model, views in parallel) |
 | [image-pipeline](./image-pipeline/prompt.md) | Parallel image processing pipeline with sharp | pipeline with parallel workers |
 | [snake-game](./snake-game/prompt.md) | Browser snake game with unit-testable game logic | feature-parallel |
+| [long-parallel-stress](./long-parallel-stress/prompt.md) | 16 steps, 12 independent module nodes held at 3-parallel for tens of minutes (OOM / scheduler stress) | wide fan-out, 4 parallel waves |
 
 Why these prompts work well with dag-plan:
 

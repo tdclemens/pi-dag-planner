@@ -1,3 +1,5 @@
 node_modules
 PLAN.md
 examples/**/*
+!examples/**/
+!examples/**/prompt.md

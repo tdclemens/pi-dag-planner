@@ -155,8 +155,9 @@ export function buildTaskPrompt(
 
 export interface RunPlanOptions {
 	cwd: string;
-	/** "provider/model" to pin on subagents (defaults to the dispatching model). */
+	/** "provider/model" to pin on subagents (defaults to the dispatching session's model). */
 	model?: string;
+	/** Thinking level to pin on subagents (defaults to the dispatching session's level). */
 	thinkingLevel?: string;
 	maxParallel?: number;
 	/**

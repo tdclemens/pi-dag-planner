@@ -128,6 +128,10 @@ All options are optional JSON config; project values override global per key. In
   "parallel": true,
   "nodeRetries": 1,
   "plannerExplore": true,
+  "plannerModel": "anthropic/claude-opus-4-5",
+  "plannerThinking": "medium",
+  "runnerModel": "openai/gpt-5",
+  "runnerThinking": "low",
   "plannerExtensions": [],
   "runnerExtensions": []
 }
@@ -140,8 +144,14 @@ All options are optional JSON config; project values override global per key. In
 | `parallel` | `true` | `false` = one node at a time in DAG order (overrides `maxParallel`) |
 | `nodeRetries` | `1` | Auto-retries per node for transient failures; agent-reported task failures are never retried |
 | `plannerExplore` | `true` | Planner explores the repo first; `false` = faster blind single call |
+| `plannerModel` | current model | Planner model as `"provider/model"` (any configured provider, not just the session's) |
+| `plannerThinking` | current level | Planner thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (the pi CLI clamps it to the model's capabilities) |
+| `runnerModel` | current model | Model for every runner node subagent, as `"provider/model"` |
+| `runnerThinking` | current level | Thinking level for every runner node subagent (same values as `plannerThinking`) |
 | `plannerExtensions` | `[]` | Extra extension paths loaded into the planner subagent (e.g. web search) |
 | `runnerExtensions` | `[]` | Extra extension paths loaded into every runner subagent |
+
+`plannerModel` / `runnerModel` default to the session's current model (and `…Thinking` to its current thinking level), so behavior is unchanged unless you set them — e.g. pin a strong model for planning and a cheap/fast one for node execution. Configured labels are validated at run start: an unknown `provider/model` or a missing API key for its provider fails before the plan is drafted.
 
 Fixed limits (not configurable): 1 re-plan on invalid JSON, 3 refine rounds, plans in `~/.agents/plans/`, 8 KB per dep / 16 KB total injected into node prompts.
 

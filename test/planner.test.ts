@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	buildBlindPlannerArgs,
 	buildPlannerArgs,
 	blindPlannerPrompt,
 	extractPlanJson,
@@ -251,6 +252,46 @@ test("buildPlannerArgs omits --thinking when undefined", () => {
 	assert.ok(!buildPlannerArgs("p/m").includes("--thinking"));
 });
 
+test("buildBlindPlannerArgs pins a tool-less planner subagent with model and thinking", () => {
+	assert.deepEqual(buildBlindPlannerArgs("anthropic/claude-x", "high", { ...DEFAULT_CONFIG, maxSteps: 12 }), [
+		"--mode", "json", "-p", "--no-session",
+		"--model", "anthropic/claude-x",
+		"--thinking", "high",
+		"--no-extensions", "--no-skills", "--no-context-files", "--no-tools",
+		"--system-prompt", blindPlannerPrompt(12),
+	]);
+});
+
+test("buildBlindPlannerArgs omits --thinking when undefined", () => {
+	assert.ok(!buildBlindPlannerArgs("p/m").includes("--thinking"));
+});
+
+test("plan() pins a configured planner model and thinking level (opts)", async () => {
+	let capturedArgs: string[] | undefined;
+	await plan(fakeCtx(), "x", {
+		modelLabel: "openai/gpt-5",
+		thinkingLevel: "low",
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--model") + 1], "openai/gpt-5");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--thinking") + 1], "low");
+});
+
+test("plan() defaults to the session model and thinking level", async () => {
+	let capturedArgs: string[] | undefined;
+	await plan({ ...fakeCtx(), thinkingLevel: "medium" }, "x", {
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--model") + 1], "test/model", "no opts → the session's current model");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--thinking") + 1], "medium", "no opts → the session's current thinking level");
+});
+
 test("agentic prompt requires exploration + verification; both prompts contract on touches", () => {
 	const prompt = plannerSystemPrompt(12);
 	assert.match(prompt, /explore the repository/i);
@@ -360,24 +401,35 @@ test("plan() automatically rejects a plan that fails the JSON schema", async () 
 	);
 });
 
-test("plan() uses the blind single completion when exploration is disabled", async () => {
-	let capturedSystemPrompt: string | undefined;
-	const ctx: any = {
-		...fakeCtx(),
-		modelRegistry: {
-			complete: async (_model: unknown, req: { systemPrompt: string }) => {
-				capturedSystemPrompt = req.systemPrompt;
-				return {
-					stopReason: "stop",
-					content: [{ type: "text", text: validPlanJson }],
-					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-				};
-			},
+test("plan() runs the blind planner as a single tool-less subagent when exploration is disabled", async () => {
+	let capturedArgs: string[] | undefined;
+	const result = await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
 		},
-	};
-	const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+	});
 	assert.ok(result);
-	assert.equal(capturedSystemPrompt, blindPlannerPrompt(DEFAULT_MAX_STEPS));
+	assert.ok(capturedArgs);
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1], blindPlannerPrompt(DEFAULT_MAX_STEPS));
+	assert.ok(capturedArgs!.includes("--no-tools"), "blind planner has no tools");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--model") + 1], "test/model", "defaults to the session model");
+});
+
+test("plan() blind path pins a configured planner model and thinking level too", async () => {
+	let capturedArgs: string[] | undefined;
+	await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		modelLabel: "google/gemini-x",
+		thinkingLevel: "off",
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--model") + 1], "google/gemini-x");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--thinking") + 1], "off");
 });
 
 // ---------------------------------------------------------------------------
@@ -537,24 +589,15 @@ test("plan() retry prompt includes the failed output and a conciseness hint for 
 
 test("plan() blind path attaches the raw output and honors the truncation hint", async () => {
 	let capturedText: string | undefined;
-	const ctx: any = {
-		...fakeCtx(),
-		modelRegistry: {
-			complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
-				capturedText = req.messages[0].content[0].text;
-				return {
-					stopReason: "stop",
-					content: [{ type: "text", text: truncatedPlanText }],
-					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-				};
-			},
-		},
-	};
 	await assert.rejects(
-		plan(ctx, "x", {
+		plan(fakeCtx(), "x", {
 			config: { ...DEFAULT_CONFIG, plannerExplore: false },
 			feedback: "planner output is not a valid plan JSON (Unterminated string in JSON at position 5)",
 			priorPlanJson: truncatedPlanText,
+			spawnImpl: (_command, args) => {
+				capturedText = args[args.length - 1];
+				return fakeProc([{ type: "message_end", message: assistantMessage(truncatedPlanText) }]);
+			},
 		}),
 		(e: unknown) => {
 			assert.ok(e instanceof PlanError, `expected PlanError, got: ${e}`);
@@ -678,21 +721,14 @@ test("plan() blind path includes the PLAN.md instructions in the user message", 
 	try {
 		const planMd = "Prefer vitest over jest for new tests.";
 		writeFileSync(join(dir, PLANNER_INSTRUCTIONS_FILE), planMd);
-		const ctx: any = {
-			...fakeCtx(),
-			cwd: dir,
-			modelRegistry: {
-				complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
-					capturedText = req.messages[0].content[0].text;
-					return {
-						stopReason: "stop",
-						content: [{ type: "text", text: validPlanJson }],
-						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-					};
-				},
+		const ctx: any = { ...fakeCtx(), cwd: dir };
+		const result = await plan(ctx, "x", {
+			config: { ...DEFAULT_CONFIG, plannerExplore: false },
+			spawnImpl: (_command, args) => {
+				capturedText = args[args.length - 1];
+				return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
 			},
-		};
-		const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+		});
 		assert.ok(result);
 		assert.match(capturedText!, /Project planning instructions \(from PLAN\.md\):/);
 		assert.ok(capturedText!.includes(planMd));
@@ -709,21 +745,14 @@ test("plan() blind path omits the instructions part when PLAN.md is absent", asy
 	const { dir, cleanup } = tempCwd();
 	let capturedText: string | undefined;
 	try {
-		const ctx: any = {
-			...fakeCtx(),
-			cwd: dir,
-			modelRegistry: {
-				complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
-					capturedText = req.messages[0].content[0].text;
-					return {
-						stopReason: "stop",
-						content: [{ type: "text", text: validPlanJson }],
-						usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-					};
-				},
+		const ctx: any = { ...fakeCtx(), cwd: dir };
+		const result = await plan(ctx, "x", {
+			config: { ...DEFAULT_CONFIG, plannerExplore: false },
+			spawnImpl: (_command, args) => {
+				capturedText = args[args.length - 1];
+				return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
 			},
-		};
-		const result = await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false } });
+		});
 		assert.ok(result);
 		assert.ok(!capturedText!.includes("Project planning instructions"));
 		assert.ok(capturedText!.startsWith("Plan this task:"));
@@ -734,21 +763,15 @@ test("plan() blind path omits the instructions part when PLAN.md is absent", asy
 
 test("plan() caps very large prior output, keeping the tail", async () => {
 	let capturedText: string | undefined;
-	const ctx: any = {
-		...fakeCtx(),
-		modelRegistry: {
-			complete: async (_model: unknown, req: { messages: { content: { text: string }[] }[] }) => {
-				capturedText = req.messages[0].content[0].text;
-				return {
-					stopReason: "stop",
-					content: [{ type: "text", text: validPlanJson }],
-					usage: { input: 1, output: 2, totalTokens: 3, cost: { total: 0 } },
-				};
-			},
-		},
-	};
 	const prior = "HEAD-MARKER-".padEnd(12000, "x") + "TAIL-MARKER-".padEnd(12000, "y");
-	await plan(ctx, "x", { config: { ...DEFAULT_CONFIG, plannerExplore: false }, priorPlanJson: prior });
+	await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		priorPlanJson: prior,
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
 	assert.match(capturedText!, /earlier output elided/);
 	assert.ok(capturedText!.includes("TAIL-MARKER"), "tail kept");
 	assert.ok(!capturedText!.includes("HEAD-MARKER"), "head elided");

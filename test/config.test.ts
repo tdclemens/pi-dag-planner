@@ -30,6 +30,10 @@ test("parseConfig accepts valid values", () => {
 		parallel: false,
 		nodeRetries: 0,
 		plannerExplore: false,
+		plannerModel: "openai/gpt-5",
+		plannerThinking: "low",
+		runnerModel: "anthropic/claude-x",
+		runnerThinking: "off",
 		plannerExtensions: ["/tmp/a.ts"],
 		runnerExtensions: ["/tmp/b.ts", "/tmp/c.ts"],
 	});
@@ -38,6 +42,10 @@ test("parseConfig accepts valid values", () => {
 	assert.equal(config.parallel, false);
 	assert.equal(config.nodeRetries, 0);
 	assert.equal(config.plannerExplore, false);
+	assert.equal(config.plannerModel, "openai/gpt-5");
+	assert.equal(config.plannerThinking, "low");
+	assert.equal(config.runnerModel, "anthropic/claude-x");
+	assert.equal(config.runnerThinking, "off");
 	assert.deepEqual(config.plannerExtensions, ["/tmp/a.ts"]);
 	assert.deepEqual(config.runnerExtensions, ["/tmp/b.ts", "/tmp/c.ts"]);
 	assert.deepEqual(warnings, []);
@@ -50,6 +58,10 @@ test("parseConfig falls back per bad key and warns", () => {
 		parallel: "maybe",
 		nodeRetries: -1,
 		plannerExplore: "yes",
+		plannerModel: 42,
+		runnerModel: "",
+		plannerThinking: "ultra",
+		runnerThinking: 5,
 		plannerExtensions: "/tmp/a.ts",
 		runnerExtensions: ["/tmp/ok.ts", "", 42],
 		bogus: 1,
@@ -59,17 +71,39 @@ test("parseConfig falls back per bad key and warns", () => {
 	assert.equal(config.parallel, DEFAULT_CONFIG.parallel);
 	assert.equal(config.nodeRetries, DEFAULT_CONFIG.nodeRetries);
 	assert.equal(config.plannerExplore, DEFAULT_CONFIG.plannerExplore);
+	assert.equal(config.plannerModel, undefined, "bad plannerModel → default (session model)");
+	assert.equal(config.runnerModel, undefined, "bad runnerModel → default (session model)");
+	assert.equal(config.plannerThinking, undefined, "bad plannerThinking → default (session level)");
+	assert.equal(config.runnerThinking, undefined, "bad runnerThinking → default (session level)");
 	assert.deepEqual(config.plannerExtensions, []);
 	assert.deepEqual(config.runnerExtensions, ["/tmp/ok.ts"]);
-	assert.equal(warnings.length, 9);
+	assert.equal(warnings.length, 13);
 	assert.ok(warnings.some((w) => w.includes('"maxSteps"')));
 	assert.ok(warnings.some((w) => w.includes('"maxParallel"')));
 	assert.ok(warnings.some((w) => w.includes('"parallel"')));
 	assert.ok(warnings.some((w) => w.includes('"nodeRetries"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExplore"')));
+	assert.ok(warnings.some((w) => w.includes('"plannerModel"')));
+	assert.ok(warnings.some((w) => w.includes('"runnerModel"')));
+	assert.ok(warnings.some((w) => w.includes('"plannerThinking"')));
+	assert.ok(warnings.some((w) => w.includes('"runnerThinking"')));
 	assert.ok(warnings.some((w) => w.includes('"plannerExtensions"')));
 	assert.ok(warnings.some((w) => w.includes('"runnerExtensions"')));
 	assert.ok(warnings.some((w) => w.includes('"bogus"')));
+});
+
+test("parseConfig accepts model labels (trimmed) and all thinking levels", () => {
+	const { config, warnings } = parseConfig({
+		plannerModel: "  openai/gpt-5  ",
+		runnerModel: "anthropic/claude-x",
+		plannerThinking: "max",
+		runnerThinking: "off",
+	});
+	assert.equal(warnings.length, 0);
+	assert.equal(config.plannerModel, "openai/gpt-5");
+	assert.equal(config.runnerModel, "anthropic/claude-x");
+	assert.equal(config.plannerThinking, "max");
+	assert.equal(config.runnerThinking, "off");
 });
 
 test("parseConfig trims and de-duplicates extension entries", () => {

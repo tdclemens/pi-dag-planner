@@ -1,22 +1,29 @@
 /**
- * Planner: explores the repo as a read-only pi subagent (default) or makes a
- * single blind LLM call (plannerExplore: false in the config), then robust
- * JSON extraction and automatic validation of the plan against the canonical
+ * Planner: runs as a pi subagent (one of two flavors), then robust JSON
+ * extraction and automatic validation of the plan against the canonical
  * JSON schema (src/schema.ts) plus the acyclicity rule. `extractPlanJson`
  * is pure and unit-testable.
+ *
+ * Flavors (config "plannerExplore"):
+ * - exploring (default): read-only repo tools, so the planner can inspect
+ *   the repository before emitting the plan JSON.
+ * - blind (faster): a single tool-less LLM completion.
+ *
+ * Both pin the planner model and thinking level via CLI flags: config
+ * "plannerModel"/"plannerThinking" when set (host resolves them), else the
+ * session's current model (`ctx.model`) and thinking level. The pi CLI
+ * clamps the level to the model's capabilities.
  */
 
 import type { ChildProcess } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, type DagPlanConfig } from "./config.ts";
 import { getMaxSteps, validatePlan } from "./dag.ts";
 import { runPiSubagent } from "./executor.ts";
 import { formatSnippetPlain } from "./ui.ts";
-import type { DagNode, DagPlan, PlannerResult, UsageStats } from "./types.ts";
-import { emptyUsage } from "./types.ts";
+import type { DagNode, DagPlan, PlannerResult } from "./types.ts";
 
 /**
  * Default planner system prompt: the planner is a read-only agent that may
@@ -177,6 +184,21 @@ export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, con
 	return args;
 }
 
+/**
+ * pi CLI flags for the blind planner subagent (plannerExplore: false): a
+ * single tool-less completion — no tools, no extensions/skills/context
+ * files, its own system prompt. `modelLabel` and `thinkingLevel` come from
+ * config "plannerModel"/"plannerThinking" when set, else the session's
+ * current model and thinking level (the host resolves the defaults).
+ */
+export function buildBlindPlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
+	if (thinkingLevel) args.push("--thinking", thinkingLevel);
+	args.push("--no-extensions", "--no-skills", "--no-context-files", "--no-tools");
+	args.push("--system-prompt", blindPlannerPrompt(getMaxSteps(config)));
+	return args;
+}
+
 export interface ExtractedPlan {
 	plan: DagPlan;
 	/** The plan as normalized JSON (source of truth for the saved markdown). */
@@ -317,6 +339,17 @@ export interface PlanOptions {
 	priorPlanJson?: string;
 	/** The dag-plan config for this run (defaults apply when omitted). */
 	config?: DagPlanConfig;
+	/**
+	 * Planner model as a "provider/model" label (config "plannerModel",
+	 * resolved/validated by the host). Default: the session's current model.
+	 */
+	modelLabel?: string;
+	/**
+	 * Planner thinking level (config "plannerThinking" or the session's
+	 * current level — the host resolves the default). Undefined = the
+	 * model's own default thinking behavior.
+	 */
+	thinkingLevel?: string;
 	/** Live planner activity (formatted tool-call snippets) for the UI. */
 	onExplore?: (snippet: string) => void;
 	/** Test seam: replace the planner subprocess spawn. */
@@ -324,14 +357,17 @@ export interface PlanOptions {
 }
 
 /**
- * Produce a plan. Default: the planner runs as a read-only pi subagent that
- * explores the repo, and the plan JSON is extracted from its final message.
- * With plannerExplore: false (config): single blind LLM completion. When the
- * project root (ctx.cwd) has a PLAN.md, its contents are injected into the
- * user text as planner-only project planning instructions
- * (loadPlannerInstructions) — the executing subagents never see it. Returns
- * null when aborted (Esc), throws a PlanError with a diagnostic otherwise
- * (the raw output that failed to parse/validate is attached when available).
+ * Produce a plan. The planner always runs as a pi subagent: by default it
+ * explores the repo read-only before planning (config plannerExplore: false
+ * = a single tool-less blind completion), and the plan JSON is extracted
+ * from its final message. Model/thinking: config "plannerModel"/
+ * "plannerThinking" when set (opts.modelLabel / opts.thinkingLevel), else
+ * the session's current model and thinking level. When the project root
+ * (ctx.cwd) has a PLAN.md, its contents are injected into the user text as
+ * planner-only project planning instructions (loadPlannerInstructions) —
+ * the executing subagents never see it. Returns null when aborted (Esc),
+ * throws a PlanError with a diagnostic otherwise (the raw output that
+ * failed to parse/validate is attached when available).
  */
 export async function plan(
 	ctx: ExtensionCommandContext,
@@ -342,6 +378,9 @@ export async function plan(
 	const model = ctx.model;
 	if (!model) throw new Error("no model selected (use /model)");
 	const cfg = opts.config ?? DEFAULT_CONFIG;
+	const exploring = plannerExplores(cfg);
+	const modelLabel = opts.modelLabel ?? `${model.provider}/${model.id}`;
+	const thinkingLevel = opts.thinkingLevel ?? ctx.thinkingLevel;
 
 	const parts: string[] = [];
 	const planMd = await loadPlannerInstructions(ctx.cwd);
@@ -360,33 +399,17 @@ export async function plan(
 	}
 	const userText = parts.join("\n\n");
 
-	if (plannerExplores(cfg)) {
-		return planExploring(ctx, userText, opts, cfg, signal);
-	}
-
-	const userMessage: UserMessage = {
-		role: "user",
-		content: [{ type: "text", text: userText }],
-		timestamp: Date.now(),
-	};
-
-	const response = await ctx.modelRegistry.complete(
-		model,
-		{ systemPrompt: blindPlannerPrompt(getMaxSteps(cfg)), messages: [userMessage] },
-		{ signal },
-	);
-
-	if (response.stopReason === "aborted") return null;
-	if (response.stopReason === "error") throw new Error(response.errorMessage ?? "planner model call failed");
-
-	const text = response.content
-		.filter((c): c is { type: "text"; text: string } => c.type === "text")
-		.map((c) => c.text)
-		.join("\n");
-
-	const { plan: planObj, json } = extractAndValidate(text, cfg);
-
-	return { plan: planObj, rawJson: json, usage: toUsageStats(response.usage) };
+	return runPlannerSubagent({
+		cwd: ctx.cwd,
+		signal,
+		args: exploring
+			? buildPlannerArgs(modelLabel, thinkingLevel, cfg)
+			: buildBlindPlannerArgs(modelLabel, thinkingLevel, cfg),
+		userText,
+		cfg,
+		spawnImpl: opts.spawnImpl,
+		onToolCall: exploring ? (toolName, argsObj) => opts.onExplore?.(formatSnippetPlain(toolName, argsObj)) : undefined,
+	});
 }
 
 /** A failed planner attempt: the diagnostic plus the raw output, if any. */
@@ -433,55 +456,39 @@ export async function planWithRetries(
 }
 
 /**
- * Explore-then-plan: run the planner as a read-only pi subagent (repo
- * inspection allowed, nothing mutable) and extract the plan JSON from its
- * final message. Returns null when aborted; throws with a diagnostic
- * otherwise (spawn/exit error, missing output, bad JSON, invalid plan).
+ * Run the planner as a pi subagent (exploring or blind — the args builder
+ * decides the flavor) and extract + validate the plan from its final
+ * message. Returns null when aborted (Esc / session); throws with a
+ * diagnostic otherwise (spawn/exit error, model error, missing output, bad
+ * JSON, invalid plan). Shared by both planner flavors: the subagent also
+ * gives the blind path uniform model/thinking handling (CLI flags) and the
+ * same abort/usage accounting as the exploring one.
  */
-async function planExploring(
-	ctx: ExtensionCommandContext,
-	userText: string,
-	opts: PlanOptions,
-	cfg: DagPlanConfig,
-	signal?: AbortSignal,
-): Promise<PlannerResult | null> {
-	const model = ctx.model!;
+async function runPlannerSubagent(opts: {
+	cwd: string;
+	signal?: AbortSignal;
+	args: string[];
+	userText: string;
+	cfg: DagPlanConfig;
+	spawnImpl?: PlanOptions["spawnImpl"];
+	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
+}): Promise<PlannerResult | null> {
 	const run = await runPiSubagent({
-		cwd: ctx.cwd,
-		signal: signal ?? new AbortController().signal,
-		args: buildPlannerArgs(`${model.provider}/${model.id}`, ctx.thinkingLevel, cfg),
-		prompt: userText,
+		cwd: opts.cwd,
+		signal: opts.signal ?? new AbortController().signal,
+		args: opts.args,
+		prompt: opts.userText,
 		spawnImpl: opts.spawnImpl,
-		onToolCall: (toolName, args) => opts.onExplore?.(formatSnippetPlain(toolName, args)),
+		onToolCall: opts.onToolCall,
 	});
-	if (signal?.aborted || run.wasAborted) return null;
+	if (opts.signal?.aborted || run.wasAborted) return null;
 	if (run.exitCode !== 0 || run.stopReason === "error") {
 		const tail = run.stderr.trim().split("\n").slice(-3).join(" ").slice(-300);
 		throw new Error(run.modelError ?? (tail || `planner subagent exited with code ${run.exitCode}`));
 	}
 	if (!run.output.trim()) throw new PlanError("planner subagent produced no final message");
 
-	const { plan: planObj, json } = extractAndValidate(run.output, cfg);
+	const { plan: planObj, json } = extractAndValidate(run.output, opts.cfg);
 
 	return { plan: planObj, rawJson: json, usage: run.usage };
-}
-
-function toUsageStats(usage: {
-	input?: number;
-	output?: number;
-	cacheRead?: number;
-	cacheWrite?: number;
-	totalTokens?: number;
-	cost?: { total?: number };
-} | undefined): UsageStats {
-	const u = emptyUsage();
-	if (!usage) return u;
-	u.input = usage.input ?? 0;
-	u.output = usage.output ?? 0;
-	u.cacheRead = usage.cacheRead ?? 0;
-	u.cacheWrite = usage.cacheWrite ?? 0;
-	u.cost = usage.cost?.total ?? 0;
-	u.contextTokens = usage.totalTokens ?? 0;
-	u.turns = 1;
-	return u;
 }

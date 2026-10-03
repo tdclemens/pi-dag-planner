@@ -68,6 +68,69 @@ function isNoOpPlan(plan: DagPlan): boolean {
 	return plan.steps.length === 0;
 }
 
+/** Effective model selection for one role (the planner, or the runner's node subagents). */
+interface RoleModels {
+	/** "provider/model" label pinned on the subagent(s). */
+	model: string;
+	/** Thinking level for the subagent(s); undefined = the model's own default behavior. */
+	thinking?: string;
+}
+
+/** Effective model selections for a whole run (planner + runner roles). */
+interface RunModels {
+	planner: RoleModels;
+	runner: RoleModels;
+}
+
+/**
+ * Resolve the configured planner/runner models (config "plannerModel" /
+ * "runnerModel" — "provider/model", any configured provider) against the
+ * session's model registry. Unconfigured roles default to the session's
+ * current model and thinking level, so behavior is unchanged unless the
+ * user opts in. Notifies an error and returns null when a configured label
+ * is not "provider/model", is unknown to the registry, or has no configured
+ * API key: a bad config must fail before the expensive plan (planner model)
+ * or per node (runner model), not mid-run.
+ */
+function resolveRunModels(
+	ctx: ExtensionCommandContext,
+	config: DagPlanConfig,
+	currentModelLabel: string,
+	currentThinkingLevel: string | undefined,
+): RunModels | null {
+	const pick = (key: "plannerModel" | "runnerModel", role: "planner" | "runner"): string | null => {
+		const label = config[key];
+		if (!label) return currentModelLabel;
+		const i = label.indexOf("/");
+		if (i <= 0 || i === label.length - 1) {
+			ctx.ui.notify(`dag-plan config: "${key}" must be "provider/model" (got "${label}")`, "error");
+			return null;
+		}
+		const provider = label.slice(0, i);
+		const model = ctx.modelRegistry.find(provider, label.slice(i + 1));
+		if (!model) {
+			ctx.ui.notify(
+				`dag-plan config: ${role} model "${label}" not found in the model registry (see pi --list-models)`,
+				"error",
+			);
+			return null;
+		}
+		if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
+			ctx.ui.notify(`dag-plan config: ${role} model "${label}" has no configured API key for provider "${provider}"`, "error");
+			return null;
+		}
+		return label;
+	};
+	const plannerModel = pick("plannerModel", "planner");
+	if (plannerModel === null) return null;
+	const runnerModel = pick("runnerModel", "runner");
+	if (runnerModel === null) return null;
+	return {
+		planner: { model: plannerModel, thinking: config.plannerThinking ?? currentThinkingLevel },
+		runner: { model: runnerModel, thinking: config.runnerThinking ?? currentThinkingLevel },
+	};
+}
+
 export default function dagPlanExtension(pi: ExtensionAPI): void {
 	let activeRun: { abort: () => void } | undefined;
 
@@ -135,6 +198,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		// missing file is a no-op; bad values warn and fall back per field.
 		const { config, warnings: configWarnings } = loadConfig(ctx.isProjectTrusted() ? ctx.cwd : undefined);
 		for (const w of configWarnings) ctx.ui.notify(`dag-plan config: ${w}`, "warning");
+		const models = resolveRunModels(ctx, config, modelLabel, ctx.thinkingLevel);
+		if (!models) return;
 
 		let prompt = args.trim();
 		if (!prompt) {
@@ -144,13 +209,13 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			if (!prompt) return;
 		}
 
-		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		const gate = await planGateAndExecute(ctx, models, config, prompt, Date.now());
 		if (!gate) return;
 
 		// ------------------------------------------------------------------
 		// Phases 3+4: execute with the live dashboard, persist, summarize
 		// ------------------------------------------------------------------
-		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+		await executePlan(ctx, models, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
 	}
 
 	/**
@@ -164,7 +229,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	 */
 	async function planGateAndExecute(
 		ctx: ExtensionCommandContext,
-		modelLabel: string,
+		models: RunModels,
 		config: DagPlanConfig,
 		prompt: string,
 		startedAt: number,
@@ -184,7 +249,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		// Phase 1: plan (bounded retries on bad JSON / invalid plan; the
 		// failed attempt's raw output is fed back so the retry can see it)
 		// ------------------------------------------------------------------
-		const planOutcome = await planWithRetries((fb, prior) => planOnce(ctx, prompt, modelLabel, config, fb, prior), {
+		const planOutcome = await planWithRetries((fb, prior) => planOnce(ctx, prompt, models.planner, config, fb, prior), {
 			isAborted: () => signal.aborted,
 		});
 		if (!planOutcome.ok) {
@@ -225,7 +290,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			refineAttempts++;
 
 			const rePlanStartedAt = Date.now();
-			const reOutcome = await planWithRetries((f, prior) => planOnce(ctx, prompt, modelLabel, config, f, prior), {
+			const reOutcome = await planWithRetries((f, prior) => planOnce(ctx, prompt, models.planner, config, f, prior), {
 				initialFeedback: fb.trim() || undefined,
 				initialPriorJson: gate.rawJson,
 				isAborted: () => signal.aborted,
@@ -325,9 +390,11 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		}
 
 		const prompt = buildCompilePrompt(diff, await loadCompileContext(ctx.cwd));
-		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		const models = resolveRunModels(ctx, config, modelLabel, ctx.thinkingLevel);
+		if (!models) return;
+		const gate = await planGateAndExecute(ctx, models, config, prompt, Date.now());
 		if (!gate) return;
-		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+		await executePlan(ctx, models, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
 	}
 
 	/**
@@ -362,9 +429,11 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		}
 
 		const prompt = buildCleanPrompt(productMd, await loadCompileContext(ctx.cwd));
-		const gate = await planGateAndExecute(ctx, modelLabel, config, prompt, Date.now());
+		const models = resolveRunModels(ctx, config, modelLabel, ctx.thinkingLevel);
+		if (!models) return;
+		const gate = await planGateAndExecute(ctx, models, config, prompt, Date.now());
 		if (!gate) return;
-		await executePlan(ctx, modelLabel, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
+		await executePlan(ctx, models, config, prompt, gate.plan, gate.planPath, gate.plannerUsage, gate.planDurationMs, {}, false);
 	}
 
 	/** True when `cwd` is inside a git work tree (never throws). */
@@ -414,7 +483,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	 */
 	async function executePlan(
 		ctx: ExtensionCommandContext,
-		modelLabel: string,
+		models: RunModels,
 		config: DagPlanConfig,
 		originalPrompt: string,
 		dag: DagPlan,
@@ -476,8 +545,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			);
 			const promise = runPlan(dag, {
 				cwd: ctx.cwd,
-				model: modelLabel,
-				thinkingLevel: ctx.thinkingLevel,
+				model: models.runner.model,
+				thinkingLevel: models.runner.thinking,
 				config,
 				originalPrompt,
 				signal: controller.signal,
@@ -654,6 +723,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
+		const models = resolveRunModels(ctx, config, modelLabel, ctx.thinkingLevel);
+		if (!models) return;
+
 		pi.sendMessage({
 			customType: PLAN_MESSAGE_TYPE,
 			content: `DAG Plan (resume) — ${plan.goal} (${plan.steps.length} steps, ${doneCount} done)`,
@@ -670,7 +742,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		await executePlan(ctx, modelLabel, config, originalPrompt, plan, planPath, emptyUsage(), undefined, initialResults, true);
+		await executePlan(ctx, models, config, originalPrompt, plan, planPath, emptyUsage(), undefined, initialResults, true);
 	}
 
 	/** Resolve a user-supplied plan file path (~ or cwd-relative) to absolute. */
@@ -689,15 +761,15 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	function planOnce(
 		ctx: ExtensionCommandContext,
 		prompt: string,
-		modelLabel: string,
+		planner: RoleModels,
 		config: DagPlanConfig,
 		feedback: string | undefined,
 		priorJson: string | undefined,
 	): Promise<PlannerResult | PlanRetryFailure | null> {
 		return ctx.ui.custom<PlannerResult | PlanRetryFailure | null>((tui, theme, _kb, done) => {
 			const label = plannerExplores(config)
-				? `Planning with ${modelLabel} (exploring repo)…`
-				: `Planning with ${modelLabel}…`;
+				? `Planning with ${planner.model} (exploring repo)…`
+				: `Planning with ${planner.model}…`;
 			const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
 			// Planner tool activity renders inside the loader box (not the
 			// status bar): a line inserted right after the label, updated in
@@ -720,6 +792,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				prompt,
 				{
 					config,
+					modelLabel: planner.model,
+					thinkingLevel: planner.thinking,
 					feedback,
 					priorPlanJson: priorJson,
 					onExplore: (snippet) => {

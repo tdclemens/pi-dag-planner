@@ -14,9 +14,19 @@
  *     "parallel": true,          // false = run nodes strictly in sequence (one at a time)
  *     "nodeRetries": 1,          // auto-retries per node for transient failures (0 disables)
  *     "plannerExplore": true,    // planner explores the repo (read-only) before planning
+ *     "plannerModel": "anthropic/claude-opus-4-5",  // planner model (default: the session's current model)
+ *     "plannerThinking": "medium",               // planner thinking level (default: the session's current level)
+ *     "runnerModel": "openai/gpt-5",             // runner node model (default: the session's current model)
+ *     "runnerThinking": "low",                   // runner node thinking level (default: the session's current level)
  *     "plannerExtensions": [],   // extra extensions loaded into the planner subagent
  *     "runnerExtensions": []     // extra extensions loaded into every runner node subagent
  *   }
+ *
+ * Model labels are "provider/model" and may name a different provider than
+ * the session's current one; they are validated against the model registry
+ * when a run starts (unknown label or missing API key = error, before the
+ * plan is drafted). Thinking levels follow pi's --thinking flag and are
+ * clamped to the model's capabilities by the pi CLI.
  *
  * Extension paths may be absolute, start with `~/`, or be relative to the
  * directory of the config file that provides them (same convention as pi's
@@ -32,6 +42,13 @@ import { isAbsolute, join, resolve } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_MAX_STEPS } from "./dag.ts";
 import { DEFAULT_MAX_PARALLEL, DEFAULT_NODE_RETRIES } from "./executor.ts";
+
+/**
+ * Valid thinking levels for the config (mirrors pi's `--thinking` flag).
+ * `off` disables thinking entirely; the rest are pi's reasoning levels.
+ */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 /** Fully-resolved dag-plan configuration (defaults already applied). */
 export interface DagPlanConfig {
@@ -56,8 +73,28 @@ export interface DagPlanConfig {
 	 * `false` = the faster single blind LLM call (no tools).
 	 */
 	plannerExplore: boolean;
+	/**
+	 * Model for the planner, "provider/model" (any configured provider, not
+	 * just the session's). Absent = the session's current model.
+	 */
+	plannerModel?: string;
+	/**
+	 * Thinking level for the planner (one of THINKING_LEVELS).
+	 * Absent = the session's current thinking level.
+	 */
+	plannerThinking?: string;
 	/** Extra extensions loaded into the planner subagent via `-e` (resolved absolute paths). */
 	plannerExtensions: string[];
+	/**
+	 * Model for every runner node subagent, "provider/model" (any configured
+	 * provider, not just the session's). Absent = the session's current model.
+	 */
+	runnerModel?: string;
+	/**
+	 * Thinking level for every runner node subagent (one of THINKING_LEVELS).
+	 * Absent = the session's current thinking level.
+	 */
+	runnerThinking?: string;
 	/** Extra extensions loaded into every runner node subagent via `-e` (resolved absolute paths). */
 	runnerExtensions: string[];
 }
@@ -188,6 +225,24 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 						`"plannerExplore" must be true or false (got ${describe(value)}) — using default ${DEFAULT_CONFIG.plannerExplore}`,
 					);
 				break;
+			case "plannerModel":
+			case "runnerModel": {
+				if (typeof value === "string" && value.trim()) config[key] = value.trim();
+				else
+					warnings.push(
+						`"${key}" must be a "provider/model" string (got ${describe(value)}) — using default (the session's current model)`,
+					);
+				break;
+			}
+			case "plannerThinking":
+			case "runnerThinking": {
+				if (typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value)) config[key] = value;
+				else
+					warnings.push(
+						`"${key}" must be one of ${THINKING_LEVELS.join(" | ")} (got ${describe(value)}) — using default (the session's current thinking level)`,
+					);
+				break;
+			}
 			case "plannerExtensions":
 				config.plannerExtensions = stringList(value, key, warnings);
 				break;

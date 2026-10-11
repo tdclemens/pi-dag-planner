@@ -396,6 +396,8 @@ export interface PiSubagentResult {
 	exitCode: number;
 	/** Final assistant text; "" when no text message was received. */
 	output: string;
+	/** The last assistant message observed in the stream (the source of `output`). */
+	lastAssistant?: AssistantMessage;
 	usage: UsageStats;
 	model?: string;
 	stopReason?: string;
@@ -417,6 +419,12 @@ export interface PiSubagentOptions {
 	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
 	/** Extra env for the child, merged over process.env (e.g. DAG_NODE_ID). */
 	env?: Record<string, string>;
+	/**
+	 * Safety valve for stdout: once the accumulated stream exceeds this many
+	 * bytes, further chunks are dropped (a pathological child cannot OOM the
+	 * parent). The explore researcher (src/explore-tool.ts) passes 1 MiB.
+	 */
+	maxOutputBytes?: number;
 	/** Test seam: replace the subprocess spawn. The env arg is optional for fakes. */
 	spawnImpl?: (command: string, args: string[], cwd: string, env?: Record<string, string>) => ChildProcess;
 }
@@ -438,6 +446,7 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 
 	let stderr = "";
 	let buffer = "";
+	let outputBytes = 0;
 
 	const processLine = (line: string) => {
 		if (!line.trim()) return;
@@ -451,6 +460,7 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 			opts.onToolCall?.(String(event.toolName), event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {});
 		} else if (event.type === "message_end" && event.message && event.message.role === "assistant") {
 			const msg = event.message as AssistantMessage;
+			result.lastAssistant = msg;
 			result.usage = addUsage(result.usage, usageFromMessage(msg));
 			result.usage.turns += 1;
 			if (msg.model) result.model = msg.model;
@@ -490,6 +500,10 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 		};
 
 		proc.stdout?.on("data", (data: Buffer) => {
+			if (opts.maxOutputBytes !== undefined) {
+				outputBytes += data.length;
+				if (outputBytes > opts.maxOutputBytes) return; // over budget: drop the rest
+			}
 			buffer += data.toString();
 			const lines = buffer.split("\n");
 			buffer = lines.pop() ?? "";

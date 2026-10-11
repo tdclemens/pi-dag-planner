@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager } from "@earendil-works/pi-tui";
-import { reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
+import { formatSnippet, formatSnippetPlain, reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
 import type { DagEvent, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
 
@@ -341,6 +341,41 @@ test("reportExcerpt: truncated to maxChars with ellipsis", () => {
 	const out = reportExcerpt(result({ id: "a", status: "done", output: "x".repeat(300) }), 200);
 	assert.equal(out.length, 201);
 	assert.ok(out.endsWith("…"), out);
+});
+
+// ---------------------------------------------------------------------------
+// formatSnippet / formatSnippetPlain — the explore tool
+// ---------------------------------------------------------------------------
+
+test("formatSnippetPlain: explore shows the question, truncated at 60 chars", () => {
+	assert.equal(
+		formatSnippetPlain("explore", { question: "where is auth handled?" }),
+		"explore where is auth handled?",
+	);
+	const out = formatSnippetPlain("explore", { question: "x".repeat(100) });
+	assert.equal(out, `explore ${"x".repeat(60)}…`, out);
+});
+
+test("formatSnippetPlain: explore falls back gracefully when the question is missing", () => {
+	const out = formatSnippetPlain("explore", {});
+	assert.ok(out.startsWith("explore"), out);
+	assert.ok(!out.includes("undefined") && !out.includes("null"), out);
+});
+
+test("formatSnippet: explore renders the question in accent, truncated at 60 chars", () => {
+	// The fake theme passes text through, so the themed output is plain text here.
+	assert.equal(
+		formatSnippet("explore", { question: "where is auth handled?" }, theme.fg.bind(theme)),
+		"explore where is auth handled?",
+	);
+	const out = formatSnippet("explore", { question: "y".repeat(100) }, theme.fg.bind(theme));
+	assert.equal(out, `explore ${"y".repeat(60)}…`, out);
+});
+
+test("formatSnippet: explore falls back gracefully when the question is missing", () => {
+	const out = formatSnippet("explore", {}, theme.fg.bind(theme));
+	assert.ok(out.startsWith("explore"), out);
+	assert.ok(!out.includes("undefined") && !out.includes("null"), out);
 });
 
 // ---------------------------------------------------------------------------

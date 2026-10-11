@@ -21,6 +21,7 @@ import {
 	MAX_PLAN_MD_CHARS,
 	PLANNER_INSTRUCTIONS_FILE,
 } from "../src/planner.ts";
+import { EXPLORE_TOOL_PATH } from "../src/explore-tool.ts";
 import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { emptyUsage } from "../src/types.ts";
@@ -204,13 +205,14 @@ function assistantMessage(text: string, extra: Record<string, unknown> = {}) {
 	};
 }
 
-test("buildPlannerArgs pins a read-only, extension-free planner subagent", () => {
+test("buildPlannerArgs pins a read-only, extension-free planner subagent with the explore tool", () => {
 	assert.deepEqual(buildPlannerArgs("anthropic/claude-x", "medium", { ...DEFAULT_CONFIG, maxSteps: 12 }), [
 		"--mode", "json", "-p", "--no-session",
+		"--no-extensions", "--no-skills", "--no-context-files",
+		"--tools", "read,grep,find,ls,explore",
+		"-e", EXPLORE_TOOL_PATH,
 		"--model", "anthropic/claude-x",
 		"--thinking", "medium",
-		"--no-extensions", "--no-skills", "--no-context-files",
-		"--tools", "read,grep,find,ls",
 		"--system-prompt", plannerSystemPrompt(12),
 	]);
 });
@@ -225,20 +227,32 @@ test("buildPlannerArgs interpolates the configured (or default) soft cap", () =>
 test("buildPlannerArgs loads configured planner extensions and drops the read-only tool lock", () => {
 	const cfg = { ...DEFAULT_CONFIG, plannerExtensions: ["/tmp/plan-ext.ts", "/tmp/other.ts"] };
 	const args = buildPlannerArgs("p/m", undefined, cfg);
-	assert.deepEqual(args.slice(args.indexOf("-e"), args.indexOf("--system-prompt")), [
+	const firstExt = args.indexOf("/tmp/plan-ext.ts");
+	assert.ok(firstExt > 0, "user extension entries present");
+	assert.deepEqual(args.slice(firstExt - 1, args.indexOf("--system-prompt")), [
 		"-e",
 		"/tmp/plan-ext.ts",
 		"-e",
 		"/tmp/other.ts",
 	]);
 	assert.ok(!args.includes("--tools"), "no strict --tools allow-list once extensions add tools");
+	assert.deepEqual(
+		args.slice(args.indexOf("--no-context-files") + 1, args.indexOf("--model")),
+		["-e", EXPLORE_TOOL_PATH],
+		"the explore tool stays loaded even when extensions add tools",
+	);
 	assert.ok(
 		args.includes("--no-extensions") && args.includes("--no-skills") && args.includes("--no-context-files"),
 		"still locked down from auto-discovery",
 	);
-	// without extensions the read-only tool set returns
+	// without extensions the read-only tool set (incl. explore) returns
 	const bare = buildPlannerArgs("p/m");
-	assert.equal(bare[bare.indexOf("--tools") + 1], "read,grep,find,ls");
+	assert.equal(bare[bare.indexOf("--tools") + 1], "read,grep,find,ls,explore");
+	assert.deepEqual(
+		bare.slice(bare.indexOf("--tools") + 2, bare.indexOf("--model")),
+		["-e", EXPLORE_TOOL_PATH],
+		"explore -e entry immediately after the --tools pair",
+	);
 });
 
 test("planner prompts interpolate the soft step cap", () => {
@@ -295,6 +309,14 @@ test("plan() defaults to the session model and thinking level", async () => {
 test("agentic prompt requires exploration + verification; both prompts contract on touches", () => {
 	const prompt = plannerSystemPrompt(12);
 	assert.match(prompt, /explore the repository/i);
+	assert.match(prompt, /`explore` tool runs a dedicated read-only researcher subagent/i, "explore tool = a separate researcher subagent");
+	assert.match(prompt, /reads the repository in ITS OWN context/i, "researcher reads in its own context");
+	assert.match(prompt, /stays small and available for drafting the plan JSON/i, "context-saving rationale");
+	assert.match(prompt, /every file you read directly lands in your context/i, "direct reads cost the planner's context");
+	assert.match(prompt, /at most ~4 explore calls/i, "bounded explore budget");
+	assert.match(prompt, /self-contained question/i, "researcher sees only the question");
+	assert.match(prompt, /follow-up explore question/i, "one focused follow-up beats many own reads");
+	assert.match(prompt, /only to quickly verify/i, "own reads only to verify a fact a brief surfaced");
 	assert.match(prompt, /read-only/i);
 	assert.match(prompt, /verification is required/i);
 	assert.match(prompt, /ONLY a JSON object/i);
@@ -346,7 +368,7 @@ test("plan() explores via subprocess and extracts the plan", async () => {
 		spawnImpl: (_command, args, cwd) => {
 			assert.equal(cwd, "/tmp/repo");
 			assert.equal(args[args.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS));
-			assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls");
+			assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls,explore");
 			return fakeProc([
 				{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
 				{ type: "message_end", message: assistantMessage(`Plan:\n\n\u0060\u0060\u0060json\n${validPlanJson}\n\u0060\u0060\u0060`) },

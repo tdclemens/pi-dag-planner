@@ -144,6 +144,8 @@ export function formatSnippetPlain(toolName: string, args: Record<string, unknow
 			return `find /${args.pattern ?? "*"}/ in ${path}`;
 		case "grep":
 			return `grep /${args.pattern ?? ""}/ in ${path}`;
+		case "explore":
+			return `explore ${truncate(String(args.question ?? ""), 60)}`;
 		default: {
 			const argsStr = JSON.stringify(args);
 			return `${toolName} ${truncate(argsStr, 50)}`;
@@ -184,6 +186,8 @@ export function formatSnippet(toolName: string, args: Record<string, unknown>, f
 			return fg("muted", "find ") + fg("accent", `/${args.pattern ?? "*"}/`) + fg("dim", ` in ${shortenHome(path)}`);
 		case "grep":
 			return fg("muted", "grep ") + fg("accent", `/${args.pattern ?? ""}/`) + fg("dim", ` in ${shortenHome(path)}`);
+		case "explore":
+			return fg("muted", "explore ") + fg("accent", truncate(String(args.question ?? ""), 60));
 		default: {
 			const argsStr = JSON.stringify(args);
 			return fg("accent", toolName) + fg("dim", ` ${truncate(argsStr, 50)}`);

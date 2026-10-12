@@ -52,6 +52,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Sign the version-bump commit with the GitHub Actions bot key.
+      # The repository ruleset requires verified commit signatures; a commit
+      # signed with the bot key (and pushed with GITHUB_TOKEN) is marked
+      # "Verified" on GitHub.
+      - name: Configure git signing
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config commit.gpgsign true
+          git config tag.gpgsign true
+          git config gpg.format ssh
+          mkdir -p ~/.ssh
+          echo "$SSH_GPG_KEY" | base64 --decode > ~/.ssh/id
+          chmod 600 ~/.ssh/id
+          ssh-keygen -y -f ~/.ssh/id > ~/.ssh/id.pub
+          git config user.signingkey $HOME/.ssh/id.pub
+
       - name: Run semantic-release
         run: npx semantic-release
         env:

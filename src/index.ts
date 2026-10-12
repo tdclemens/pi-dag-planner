@@ -42,6 +42,7 @@ import {
 import { loadConfig, type DagPlanConfig } from "./config.ts";
 import { normalizePlan, plan, plannerExplores, PlanError, planWithRetries, type PlanRetryFailure } from "./planner.ts";
 import * as plans from "./plans.ts";
+import { getExtensionVersion } from "./version.ts";
 import { validatePlan } from "./dag.ts";
 import type { DagEvent, DagPlan, NodeResult, PlannerResult, UsageStats } from "./types.ts";
 import { addUsage, emptyUsage } from "./types.ts";
@@ -136,10 +137,15 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 
 	pi.registerCommand("dag-plan", {
 		description:
-			"Plan a DAG of subagent steps, then execute them in parallel (resume <plan-file>: continue an interrupted run)",
+			"Plan a DAG of subagent steps, then execute them in parallel (resume <plan-file>: continue an interrupted run) · --version: print version",
 		handler: async (args, ctx) => {
 			try {
-				const resumeMatch = args.trim().match(/^resume\s+(\S+)/);
+				const arg = args.trim();
+				if (arg === "--version" || arg === "-v") {
+					ctx.ui.notify(`pi-dag-plan ${await getExtensionVersion()}`, "info");
+					return;
+				}
+				const resumeMatch = arg.match(/^resume\s+(\S+)/);
 				if (resumeMatch) {
 					await runResumeFlow(resumeMatch[1], ctx);
 					return;

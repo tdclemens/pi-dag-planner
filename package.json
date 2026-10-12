@@ -4,6 +4,10 @@
 	"description": "pi extension: /dag-plan — plan a DAG of subagent steps and execute them in parallel with live progress",
 	"license": "MIT",
 	"type": "module",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/tdclemens/pi-dag-planner.git"
+	},
 	"keywords": [
 		"pi-package"
 	],
@@ -20,7 +24,13 @@
 		"@earendil-works/pi-ai": "0.84.4",
 		"@earendil-works/pi-coding-agent": "0.84.4",
 		"@earendil-works/pi-tui": "0.84.4",
+		"@semantic-release/commit-analyzer": "^13.0.1",
+		"@semantic-release/git": "^10.0.1",
+		"@semantic-release/github": "^12.0.10",
+		"@semantic-release/npm": "^13.2.0",
+		"@semantic-release/release-notes-generator": "^14.1.1",
 		"@types/node": "^22.0.0",
+		"semantic-release": "^25.0.9",
 		"tsx": "^4.0.0",
 		"typescript": "^5.0.0"
 	},

@@ -18,9 +18,12 @@
 	},
 	"scripts": {
 		"test": "tsx --test test/*.test.ts",
-		"typecheck": "tsc --noEmit"
+		"typecheck": "tsc --noEmit",
+		"prepare": "husky"
 	},
 	"devDependencies": {
+		"@commitlint/cli": "^21.2.3",
+		"@commitlint/config-conventional": "^21.2.3",
 		"@earendil-works/pi-ai": "0.84.4",
 		"@earendil-works/pi-coding-agent": "0.84.4",
 		"@earendil-works/pi-tui": "0.84.4",
@@ -30,6 +33,7 @@
 		"@semantic-release/npm": "^13.2.0",
 		"@semantic-release/release-notes-generator": "^14.1.1",
 		"@types/node": "^22.0.0",
+		"husky": "^9.1.7",
 		"semantic-release": "^25.0.9",
 		"tsx": "^4.0.0",
 		"typescript": "^5.0.0"

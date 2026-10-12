@@ -188,6 +188,18 @@ src/
 └── types.ts     # shared types
 ```
 
+## Releasing
+
+Releases are automated: a GitHub Actions workflow (`.github/workflows/release.yml`) runs [semantic-release](https://github.com/semantic-release/semantic-release) on every push to `main` (after a typecheck + test check job). Commit with [Conventional Commits](https://www.conventionalcommits.org) and the version follows:
+
+| Commit | Bump |
+|--------|------|
+| `feat:` | MINOR |
+| `fix:` | PATCH |
+| Breaking change (`!` in the type or a `BREAKING CHANGE` note) | MAJOR (MINOR while below 1.0) |
+
+Each release bumps `package.json`, commits the bump, tags `vX.Y.Z`, and publishes a GitHub release with generated notes. The package installs from git (`pi install git:…`), not npm — there is no registry publish step.
+
 ## Examples
 
 [`examples/`](./examples/README.md) contains ready-to-paste prompts that showcase different DAG shapes (wide fan-out, pipelines, feature-parallel).

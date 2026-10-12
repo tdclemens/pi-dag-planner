@@ -55,19 +55,31 @@ jobs:
       # Sign the version-bump commit with the GitHub Actions bot key.
       # The repository ruleset requires verified commit signatures; a commit
       # signed with the bot key (and pushed with GITHUB_TOKEN) is marked
-      # "Verified" on GitHub.
+      # "Verified" on GitHub. $SSH_GPG_KEY is a base64-encoded OpenPGP (gpg)
+      # key, so we import it into gpg and sign with OpenPGP.
       - name: Configure git signing
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config commit.gpgsign true
           git config tag.gpgsign true
-          git config gpg.format ssh
-          mkdir -p ~/.ssh
-          echo "$SSH_GPG_KEY" | base64 --decode > ~/.ssh/id
-          chmod 600 ~/.ssh/id
-          ssh-keygen -y -f ~/.ssh/id > ~/.ssh/id.pub
-          git config user.signingkey $HOME/.ssh/id.pub
+          git config gpg.format openpgp
+          git config gpg.program gpg
+          echo "$SSH_GPG_KEY" | base64 --decode > bot-key
+          if ! gpg --batch --import bot-key; then
+            # Key was armored: convert to binary and import again
+            gpg --batch --dearmor --output bot-key.gpg < bot-key
+            gpg --batch --import bot-key.gpg
+          fi
+          # The fingerprint is on the "fpr:" line (the "sec:" line's
+          # fingerprint field is empty in modern GnuPG)
+          fpr=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+          if [ -z "$fpr" ]; then
+            echo "ERROR: could not import the GitHub Actions bot signing key (SSH_GPG_KEY)"
+            exit 1
+          fi
+          git config user.signingkey "$fpr"
+          gpg --batch --fingerprint "$fpr"
 
       - name: Run semantic-release
         run: npx semantic-release

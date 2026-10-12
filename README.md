@@ -72,6 +72,8 @@ DAG runner — 2/4 done, 1 running, 1 pending (esc: cancel)
 /dag-plan resume ~/.agents/plans/20250101-120000-add-unit-tests.md
 ```
 
+**Version.** /dag-plan --version (or -v) prints the extension version from package.json.
+
 ### `/dag-compile`
 
 `PRODUCT.md` in the project root is the source of truth for what the product should be. The command reads its uncommitted git diff and drafts a DAG plan for the changes that bring the code in line — same review card, gate, execution, and plan files as `/dag-plan`.

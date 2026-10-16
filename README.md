@@ -91,7 +91,7 @@ The intended loop: `init` → commit baseline → edit `PRODUCT.md` → `/dag-co
 
 ## How it works
 
-**Planner.** The model must respond with one JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }`. `steps: []` is a valid no-op plan. Each step prompt is self-contained (subagents share no context) and kept to one unit of work — oversized steps get a ⚠ warning on the card. Invalid or cyclic plans are rejected and re-planned once with the error as feedback.
+**Planner.** The model must respond with one JSON document: `{ goal, steps: [{ id, title, prompt, dependsOn[], touches[] }] }`. `steps: []` is a valid no-op plan. Each step prompt is self-contained (subagents share no context) and kept to one unit of work — oversized steps get a ⚠ warning on the card. In microtasks mode (`microtasks`, default off) each step is the absolute smallest unit of logical work — one file, one test, one import block — in a flat, wide DAG; because every microtask runs as an isolated subagent with no shared context, each prompt states exactly what to look for in its prerequisites' outputs (a defense against context fragmentation), and the step-length rules are relaxed (≤300-word target, 460-word warning) to fit that self-contained prose. Invalid or cyclic plans are rejected and re-planned once with the error as feedback.
 
 **Explore subagent.** With `plannerExplore` (default on), the planner delegates repo exploration to a dedicated read-only researcher: it asks focused, self-contained questions (at most ~4 explore calls — the researcher sees only the question, not the planning conversation) and gets back one compact markdown brief per question (direct answer, key files, exact commands, notes) capped at 16 KB. Only the brief enters the planner's context, which stays available for drafting the plan JSON. The researcher inherits the planner's model and thinking level; if a researcher run fails, the planner falls back to its own read/grep/find/ls tools for whatever it still needs.
 
@@ -130,6 +130,7 @@ All options are optional JSON config; project values override global per key. In
   "maxSteps": 20,
   "maxParallel": 4,
   "parallel": true,
+  "microtasks": false,
   "nodeRetries": 1,
   "plannerExplore": true,
   "plannerModel": "anthropic/claude-opus-4-5",
@@ -146,6 +147,7 @@ All options are optional JSON config; project values override global per key. In
 | `maxSteps` | `20` | Soft step-count cap; plans above it get a ⚠ (hard ceiling 32, then rejected) |
 | `maxParallel` | `4` | Max concurrent node subagents |
 | `parallel` | `true` | `false` = one node at a time in DAG order (overrides `maxParallel`) |
+| `microtasks` | `false` | Microtasks mode: the planner emits ultra-granular micro-steps (one atomic operation each, in a flat, wide DAG) and the step-prompt length limits are relaxed (≤300-word target, 460-word warning, vs the usual 150/230) — each isolated microtask prompt must be fully self-contained, since workers share no context. The plan card shows a `(microtasks)` tag. Usually pair with a higher `maxSteps` |
 | `nodeRetries` | `1` | Auto-retries per node for transient failures; agent-reported task failures are never retried |
 | `plannerExplore` | `true` | Planner explores the repo first via the explore subagent; `false` = faster blind single call. Also enables the `explore` tool — no new keys: the researcher inherits `plannerModel`/`plannerThinking` |
 | `plannerModel` | current model | Planner model as `"provider/model"` (any configured provider, not just the session's) |

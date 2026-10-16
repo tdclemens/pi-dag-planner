@@ -12,6 +12,7 @@
  *     "maxSteps": 20,            // soft step-count cap (planner guidance + plan-card warning)
  *     "maxParallel": 4,          // concurrent runner subagents
  *     "parallel": true,          // false = run nodes strictly in sequence (one at a time)
+ *     "microtasks": false,       // true = ultra-granular micro-step planning + relaxed step-prompt length limits
  *     "nodeRetries": 1,          // auto-retries per node for transient failures (0 disables)
  *     "plannerExplore": true,    // planner explores the repo (read-only) before planning
  *     "plannerModel": "anthropic/claude-opus-4-5",  // planner model (default: the session's current model)
@@ -63,6 +64,12 @@ export interface DagPlanConfig {
 	 */
 	parallel: boolean;
 	/**
+	 * Microtasks mode: the planner is instructed to emit ultra-granular
+	 * micro-steps — one atomic operation each — and the step-prompt length
+	 * limits are relaxed. Default off.
+	 */
+	microtasks: boolean;
+	/**
 	 * Max auto-retries per node for transient failures (subprocess crash,
 	 * model/API error, output truncation, empty response). Agent-reported
 	 * task failures are never auto-retried. 0 disables auto-retry.
@@ -103,6 +110,7 @@ export const DEFAULT_CONFIG: DagPlanConfig = {
 	maxSteps: DEFAULT_MAX_STEPS,
 	maxParallel: DEFAULT_MAX_PARALLEL,
 	parallel: true,
+	microtasks: false,
 	nodeRetries: DEFAULT_NODE_RETRIES,
 	plannerExplore: true,
 	plannerExtensions: [],
@@ -189,6 +197,7 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 		maxSteps: DEFAULT_CONFIG.maxSteps,
 		maxParallel: DEFAULT_CONFIG.maxParallel,
 		parallel: DEFAULT_CONFIG.parallel,
+		microtasks: DEFAULT_CONFIG.microtasks,
 		nodeRetries: DEFAULT_CONFIG.nodeRetries,
 		plannerExplore: DEFAULT_CONFIG.plannerExplore,
 		plannerExtensions: [],
@@ -211,6 +220,13 @@ export function parseConfig(raw: Record<string, unknown>): ParsedConfig {
 				else
 					warnings.push(
 						`"parallel" must be true or false (got ${describe(value)}) — using default ${DEFAULT_CONFIG.parallel}`,
+					);
+				break;
+			case "microtasks":
+				if (typeof value === "boolean") config.microtasks = value;
+				else
+					warnings.push(
+						`"microtasks" must be true or false (got ${describe(value)}) — using default ${DEFAULT_CONFIG.microtasks}`,
 					);
 				break;
 			case "nodeRetries": {

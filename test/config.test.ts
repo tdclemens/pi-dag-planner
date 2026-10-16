@@ -51,6 +51,20 @@ test("parseConfig accepts valid values", () => {
 	assert.deepEqual(warnings, []);
 });
 
+test("parseConfig accepts microtasks: true with no warnings", () => {
+	const { config, warnings } = parseConfig({ microtasks: true });
+	assert.equal(config.microtasks, true);
+	assert.deepEqual(warnings, []);
+});
+
+test("parseConfig falls back to false for invalid microtasks and warns", () => {
+	const { config, warnings } = parseConfig({ microtasks: "yes" });
+	assert.equal(config.microtasks, false);
+	assert.equal(config.microtasks, DEFAULT_CONFIG.microtasks);
+	assert.equal(warnings.length, 1);
+	assert.ok(warnings.some((w) => w.includes("microtasks")));
+});
+
 test("parseConfig falls back per bad key and warns", () => {
 	const { config, warnings } = parseConfig({
 		maxSteps: "twelve",

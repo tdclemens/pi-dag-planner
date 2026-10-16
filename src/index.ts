@@ -269,7 +269,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			return null;
 		}
 
-		const current = await presentPlan(ctx, planOutcome.result, prompt, planDurationMs);
+		const current = await presentPlan(ctx, planOutcome.result, prompt, planDurationMs, config);
 		if (!current) return null;
 
 		// ------------------------------------------------------------------
@@ -309,7 +309,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`No-op plan — ${reOutcome.result.plan.goal} Nothing to do; no plan file saved.`, "info");
 				return null;
 			}
-			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
+			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt, config);
 			if (!revised) return null;
 			gate = revised;
 		}
@@ -736,7 +736,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			customType: PLAN_MESSAGE_TYPE,
 			content: `DAG Plan (resume) — ${plan.goal} (${plan.steps.length} steps, ${doneCount} done)`,
 			display: true,
-			details: { plan, planPath, warnings: v.warnings, resume: { done: Object.keys(initialResults) } },
+			details: { plan, planPath, warnings: v.warnings, microtasks: config.microtasks, resume: { done: Object.keys(initialResults) } },
 		});
 
 		const choice = await ctx.ui.select(
@@ -826,6 +826,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		result: PlannerResult,
 		prompt: string,
 		planDurationMs: number,
+		config: DagPlanConfig,
 	): Promise<{
 		plan: PlannerResult["plan"];
 		planPath: string;
@@ -843,14 +844,17 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			}
 			if (ctx.signal?.aborted) return null;
 			// Non-fatal validation warnings (e.g. unordered touches overlap →
-			// implied serialization) are shown with the plan for review.
-			const v = validatePlan(result.plan);
+			// implied serialization) are shown with the plan for review. With
+			// config.microtasks on, validatePlan applies the relaxed 2×
+			// step-prompt length limits (self-contained microtask prompts run
+			// longer by design).
+			const v = validatePlan(result.plan, config);
 			const warnings = v.ok ? v.warnings : undefined;
 			pi.sendMessage({
 				customType: PLAN_MESSAGE_TYPE,
 				content: `DAG Plan — ${result.plan.goal} (${result.plan.steps.length} steps)`,
 				display: true,
-				details: { plan: result.plan, planPath, planDurationMs, warnings },
+				details: { plan: result.plan, planPath, planDurationMs, warnings, microtasks: config.microtasks },
 			});
 			return { plan: result.plan, planPath, rawJson: result.rawJson, plannerUsage: result.usage, planDurationMs };
 		})();

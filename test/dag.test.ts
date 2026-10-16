@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dependentsIndex, findCycle, getHardMaxSteps, getMaxSteps, topologicalLevels, validatePlan, stepPromptWords, stepSizeWarnings, DEFAULT_MAX_STEPS, HARD_MAX_STEPS, STEP_PROMPT_TARGET_WORDS, STEP_PROMPT_WARN_WORDS } from "../src/dag.ts";
+import { dependentsIndex, findCycle, getHardMaxSteps, getMaxSteps, topologicalLevels, validatePlan, stepPromptWords, stepSizeWarnings, DEFAULT_MAX_STEPS, HARD_MAX_STEPS, STEP_PROMPT_TARGET_WORDS, STEP_PROMPT_WARN_WORDS, MICRO_STEP_PROMPT_TARGET_WORDS, MICRO_STEP_PROMPT_WARN_WORDS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { DAG_PLAN_SCHEMA, validatePlanSchema } from "../src/schema.ts";
 import type { DagNode } from "../src/types.ts";
@@ -191,6 +191,58 @@ test("validatePlan reports size warnings but stays ok (non-fatal)", () => {
 	// healthy plans stay clean
 	const clean = validatePlan({ goal: "g", steps: [bigNode("a", 150), bigNode("b", 200)] });
 	assert.ok(clean.ok && (clean.warnings ?? []).length === 0);
+});
+
+// ---------------------------------------------------------------------------
+// Microtasks mode: relaxed (2×) step-size limits (config microtasks: true)
+// ---------------------------------------------------------------------------
+
+test("stepSizeWarnings: 300 words warns with no config but NOT in microtasks mode", () => {
+	assert.equal(stepSizeWarnings([bigNode("m", 300)]).length, 1, "300 > 230: warns in normal mode");
+	assert.deepEqual(
+		stepSizeWarnings([bigNode("m", 300)], { ...DEFAULT_CONFIG, microtasks: true }),
+		[],
+		"300 ≤ 460: quiet in microtasks mode",
+	);
+	// microtasks: false explicitly behaves like no config
+	assert.equal(stepSizeWarnings([bigNode("m", 300)], { ...DEFAULT_CONFIG, microtasks: false }).length, 1);
+});
+
+test("stepSizeWarnings: 461 words warns in BOTH normal and microtasks mode", () => {
+	assert.equal(stepSizeWarnings([bigNode("m", 461)]).length, 1, "461 > 230: normal limit");
+	assert.equal(
+		stepSizeWarnings([bigNode("m", 461)], { ...DEFAULT_CONFIG, microtasks: true }).length,
+		1,
+		"461 > 460: relaxed limit",
+	);
+});
+
+test("stepSizeWarnings: exactly 460 words does NOT warn in microtasks mode (still warns normally)", () => {
+	assert.deepEqual(stepSizeWarnings([bigNode("m", 460)], { ...DEFAULT_CONFIG, microtasks: true }), []);
+	assert.equal(stepSizeWarnings([bigNode("m", 460)]).length, 1, "460 > 230: normal limit still applies");
+});
+
+test("stepSizeWarnings: micro-mode warning names step, count, and relaxed limit (no split advice)", () => {
+	const [w] = stepSizeWarnings([bigNode("b", 461)], { ...DEFAULT_CONFIG, microtasks: true });
+	assert.ok(w);
+	assert.ok(w.includes('step "b"'), "names the step id");
+	assert.ok(w.includes("461 words"), "names the word count");
+	assert.ok(w.includes(String(MICRO_STEP_PROMPT_WARN_WORDS)), "names the relaxed warn limit (460)");
+	assert.ok(w.includes(`≤${MICRO_STEP_PROMPT_TARGET_WORDS}`), "names the relaxed target (≤300)");
+	assert.ok(w.includes("self-contained"), "advises staying self-contained");
+	assert.ok(!w.includes("split"), "must not advise splitting — microtasks are atomic");
+});
+
+test("validatePlan with microtasks config: no size warning at 300 words, one at 461", () => {
+	const micro = { ...DEFAULT_CONFIG, microtasks: true };
+	const quiet = validatePlan({ goal: "g", steps: [bigNode("a", 300)] }, micro);
+	assert.ok(quiet.ok && (quiet.warnings ?? []).length === 0, "300-word step is quiet in microtasks mode");
+	const loud = validatePlan({ goal: "g", steps: [bigNode("b", 461)] }, micro);
+	assert.equal(loud.ok, true, "oversized prompts must not fail the plan");
+	assert.ok(loud.ok && loud.warnings?.some((w) => /step "b" prompt is 461 words/.test(w)));
+	// the same 300-word step still warns without the micro config
+	const normal = validatePlan({ goal: "g", steps: [bigNode("a", 300)] });
+	assert.ok(normal.ok && normal.warnings?.some((w) => /step "a" prompt is 300 words/.test(w)));
 });
 
 test("validatePlan rejects duplicate ids", () => {

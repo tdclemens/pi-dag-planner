@@ -82,7 +82,7 @@ export function validatePlan(plan: unknown, config?: DagPlanConfig): PlanValidat
 			`plan has ${steps.length} steps (recommended max ${softMax} — raise "maxSteps" in dag-plan.json) — each step is a separate agent session, review before executing`,
 		);
 	warnings.push(...touchesOverlapWarnings(steps));
-	warnings.push(...stepSizeWarnings(steps));
+	warnings.push(...stepSizeWarnings(steps, config));
 	return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
 }
 
@@ -100,20 +100,42 @@ export function validatePlan(plan: unknown, config?: DagPlanConfig): PlanValidat
 export const STEP_PROMPT_TARGET_WORDS = 150;
 export const STEP_PROMPT_WARN_WORDS = 230;
 
+/**
+ * Relaxed (2×) step-size limits used when `config.microtasks` is on.
+ * Microtask prompts must be fully self-contained — the subagent runs in
+ * complete isolation and sees no shared session context, so the prompt has to
+ * say exactly what to take from each prerequisite output — and is therefore
+ * legitimately longer. The limit is relaxed, not removed; step-count caps
+ * (maxSteps / hard ceiling) are unchanged.
+ */
+export const MICRO_STEP_PROMPT_TARGET_WORDS = 300;
+export const MICRO_STEP_PROMPT_WARN_WORDS = 460;
+
 /** Count words in a step prompt (whitespace-split, trimmed). */
 export function stepPromptWords(prompt: string): number {
 	const t = prompt.trim();
 	return t ? t.split(/\s+/).length : 0;
 }
 
-/** One warning per step whose prompt outgrows the one-unit-of-work budget. */
-export function stepSizeWarnings(steps: DagNode[]): string[] {
+/**
+ * One warning per step whose prompt outgrows the one-unit-of-work budget.
+ * With `config.microtasks` on, the relaxed 2× MICRO_* limits apply: microtask
+ * prompts must be fully self-contained (the subagent sees no shared context)
+ * and run longer, so the warning advises trimming while staying
+ * self-contained instead of splitting (microtasks are already atomic).
+ * The normal-mode warning text is unchanged.
+ */
+export function stepSizeWarnings(steps: DagNode[], config?: DagPlanConfig): string[] {
+	const micro = config?.microtasks === true;
+	const warnWords = micro ? MICRO_STEP_PROMPT_WARN_WORDS : STEP_PROMPT_WARN_WORDS;
 	const warnings: string[] = [];
 	for (const s of steps) {
 		const words = stepPromptWords(s.prompt);
-		if (words > STEP_PROMPT_WARN_WORDS)
+		if (words > warnWords)
 			warnings.push(
-				`step "${s.id}" prompt is ${words} words — likely too big for one subagent session (target ≤${STEP_PROMPT_TARGET_WORDS} words: one file or one feature). Consider splitting it into smaller steps`,
+				micro
+					? `step "${s.id}" prompt is ${words} words — over the relaxed microtasks limit (${MICRO_STEP_PROMPT_WARN_WORDS} words; target ≤${MICRO_STEP_PROMPT_TARGET_WORDS}). Microtasks are atomic: keep the prompt short but self-contained — state exactly what to take from each prerequisite's output, and trim prose the subagent can get from its own tools`
+					: `step "${s.id}" prompt is ${words} words — likely too big for one subagent session (target ≤${STEP_PROMPT_TARGET_WORDS} words: one file or one feature). Consider splitting it into smaller steps`,
 			);
 	}
 	return warnings;

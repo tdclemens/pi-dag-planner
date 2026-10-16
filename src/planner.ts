@@ -12,6 +12,11 @@
  *   JSON.
  * - blind (faster): a single tool-less LLM completion.
  *
+ * Microtasks mode (config "microtasks", off by default): both prompts swap
+ * the one-unit-of-work step-size rule for the ultra-granular
+ * microPlannerGuidance section (self-contained microtask prompts, relaxed
+ * step-prompt length limits).
+ *
  * Both pin the planner model and thinking level via CLI flags: config
  * "plannerModel"/"plannerThinking" when set (host resolves them), else the
  * session's current model (`ctx.model`) and thinking level. The pi CLI
@@ -23,11 +28,61 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, type DagPlanConfig } from "./config.ts";
-import { getMaxSteps, validatePlan } from "./dag.ts";
+import { getMaxSteps, MICRO_STEP_PROMPT_TARGET_WORDS, STEP_PROMPT_TARGET_WORDS, validatePlan } from "./dag.ts";
 import { runPiSubagent } from "./executor.ts";
 import { EXPLORE_TOOL_PATH } from "./explore-tool.ts";
 import { formatSnippetPlain } from "./ui.ts";
 import type { DagNode, DagPlan, PlannerResult } from "./types.ts";
+
+/**
+ * Microtasks-mode planning guidance (config "microtasks": true): the
+ * ultra-granular decomposition rules that replace the one-unit-of-work
+ * step-size rule in both planner prompts (plannerSystemPrompt /
+ * blindPlannerPrompt). Every step is the absolute smallest unit of logical
+ * work; step prompts must be completely self-contained (worker subagents
+ * share no context) and the prompt word budget is relaxed from the usual
+ * STEP_PROMPT_TARGET_WORDS target to the 2× MICRO_STEP_PROMPT_TARGET_WORDS
+ * limit (src/dag.ts); the total step count must not exceed `maxSteps`.
+ */
+export function microPlannerGuidance(maxSteps: number): string {
+	return `You are in microtasks mode: an expert software architect specialized in compiling goals into ultra-granular, highly parallel execution plans. Break down the user's request into a Directed Acyclic Graph (DAG) consisting of atomic, micro-level tasks.
+
+### Core Philosophy: The Micro-Task Delta
+- **Minimize the Delta:** Every task step must represent the absolute smallest unit of logical work possible. Do not combine multiple operations into a single step.
+- **Single Responsibility:** A step should do exactly one thing (e.g., create a single file, write a single test, add an import block, refactor a single function, or run a validation script).
+- **Monolithic Steps are Forbidden:** Never emit broad tasks like "Implement the parser", "Write the UI components", or "Fix all bugs". Instead, break them down into separate sequential or parallel sub-steps (e.g., Step 1: Define TypeScript interfaces, Step 2: Implement core utility function, Step 3: Integrate utility into parser).
+
+### Concurrency & Dependency Optimization
+- **Granular 'touches':** Be highly specific with the \`touches\` array. List individual file paths, not entire directories or broad wildcards, unless absolutely necessary. This prevents file-lock collisions and maximizes parallel execution speed.
+- **Isolate Side Effects:** Steps that interact with shared, un-trackable resources (like running \`npm install\`, setting up a local database, or testing a shared port) must explicitly declare those shared strings in \`touches\` so the scheduler can serialize them correctly.
+- **Explicit Data Flow:** Because worker subagents execute in isolation and share no runtime session context, they rely entirely on the outputs of their prerequisites. Ensure that if Step B relies on a file, schema, or structural change created in Step A, Step B explicitly states this dependency in \`dependsOn\`.
+
+### Self-Contained Step Prompts
+- Every individual step \`prompt\` must be completely self-contained and descriptive.
+- Do not use vague language like "Continue from the last step."
+- Explicitly tell the executing subagent exactly what to look for in its prerequisite inputs. (e.g., "Analyze the output of step s1 to find the exported class name, then add a unit test for it in...").
+
+### Execution Limits
+- Your plan must be highly comprehensive but concise in structure. Optimize for a flat, wide DAG layout with high parallelization rather than a deep, single-file sequential chain.
+- Ensure the total step count strictly adheres to the limit — it must not exceed ${maxSteps} steps. Avoid exceeding a reasonable number of micro-steps by grouping only when items share an identical, un-splittable atomic file modification.
+- Prompt length is relaxed from the usual ~${STEP_PROMPT_TARGET_WORDS}-word target to ≤${MICRO_STEP_PROMPT_TARGET_WORDS} words: prompts are fully self-contained (workers share no context) and as short as possible; every prompt still ends with the exact verifying command.`;
+}
+
+/**
+ * Default (non-microtasks) step-size rule for the agentic prompt: one unit
+ * of work per step, plus the split/size/granularity sub-bullets. Swapped
+ * out for microPlannerGuidance when `micro` is on.
+ */
+function defaultAgenticStepSizeRule(maxSteps: number): string {
+	return `- Step size — one unit of work per step: each step is what a fresh subagent (no context beyond its own prompt) can complete in a single session — usually ONE new file, or one tightly-coupled file plus its tests, and at most one feature. Oversized steps are where runs go wrong: the subagent's context bloats, its final report truncates at the output limit, and a retry redoes hours of work from a half-finished state. Split aggressively:
+  - A step that creates 2+ substantial files, or implements 2+ distinct features (e.g. "NPC AI + quest state machine + HUD"), or would need more than ~200 words of prompt to describe, is too big — split it into separate steps linked by dependsOn.
+  - Prefer more, smaller steps over fewer, larger ones: independent steps run in parallel, so finer granularity rarely costs wall-clock time.
+  - Size the plan to the task: 1-3 steps for small, focused changes; 5-10 for medium features; up to ${maxSteps} for large multi-module builds.
+  - Keep steps roughly even in effort — no step should be twice as big as the next largest.
+  - Keep each step prompt under ~150 words: the task, the exact files, and the check that proves it is done — not detail the subagent can discover by reading the code.
+  - Each step must end green: its prompt names the exact command that verifies the step (typecheck, the test command, or a build) so no step ends in a half-finished state.
+  - ids are unique, short, kebab-case (s1, s2, … or analyze-repo).`;
+}
 
 /**
  * Default planner system prompt: the planner is a read-only agent that may
@@ -36,9 +91,11 @@ import type { DagNode, DagPlan, PlannerResult } from "./types.ts";
  * canonical schema lives in src/schema.ts; the plan is validated
  * automatically before it can be saved or executed). `maxSteps` is the soft
  * step-count cap (config "maxSteps") interpolated into the size guidance;
- * the hard ceiling is enforced by validatePlan, not by this prompt.
+ * the hard ceiling is enforced by validatePlan, not by this prompt. When
+ * `micro` (config "microtasks": true) the one-unit-of-work step-size rule is
+ * replaced with the microPlannerGuidance section.
  */
-export function plannerSystemPrompt(maxSteps: number): string {
+export function plannerSystemPrompt(maxSteps: number, micro = false): string {
 	return `You are a DAG planner with read-only repository tools. Your output is a plan that isolated coding subagents will execute in parallel. The plan must be executable to completion and produce a working, verified result for the user's request.
 
 First, explore the repository using the \`explore\` tool:
@@ -71,14 +128,7 @@ Then respond with ONLY a JSON object — no prose, no markdown fences — matchi
 }
 
 Rules:
-- Step size — one unit of work per step: each step is what a fresh subagent (no context beyond its own prompt) can complete in a single session — usually ONE new file, or one tightly-coupled file plus its tests, and at most one feature. Oversized steps are where runs go wrong: the subagent's context bloats, its final report truncates at the output limit, and a retry redoes hours of work from a half-finished state. Split aggressively:
-  - A step that creates 2+ substantial files, or implements 2+ distinct features (e.g. "NPC AI + quest state machine + HUD"), or would need more than ~200 words of prompt to describe, is too big — split it into separate steps linked by dependsOn.
-  - Prefer more, smaller steps over fewer, larger ones: independent steps run in parallel, so finer granularity rarely costs wall-clock time.
-  - Size the plan to the task: 1-3 steps for small, focused changes; 5-10 for medium features; up to ${maxSteps} for large multi-module builds.
-  - Keep steps roughly even in effort — no step should be twice as big as the next largest.
-  - Keep each step prompt under ~150 words: the task, the exact files, and the check that proves it is done — not detail the subagent can discover by reading the code.
-  - Each step must end green: its prompt names the exact command that verifies the step (typecheck, the test command, or a build) so no step ends in a half-finished state.
-  - ids are unique, short, kebab-case (s1, s2, … or analyze-repo).
+${micro ? microPlannerGuidance(maxSteps) : defaultAgenticStepSizeRule(maxSteps)}
 - "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Never reference unknown ids, and never create cycles.
 - Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Exception: steps that modify the same file or resource MUST be ordered with an edge — parallel steps must touch disjoint files.
 - "touches" is required for every step that creates or modifies anything: list the exact file paths (relative to the repo root) the step will write, plus the shared resources its commands mutate. npm/pnpm install → include "package-lock.json" and "node_modules"; a formatter → the files it rewrites; a dev server or test database → a named resource like "ports:3000" or "test-db". Read-only steps use []. Steps whose touches overlap are hard-serialized by the executor; when two steps must touch the same file, add a dependsOn edge so the order is explicit in the plan (and still list the overlap in touches).
@@ -92,11 +142,19 @@ Rules:
 - A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan — how to plan (conventions, step size, definitions of done), never what to plan: proposals or backlog items in it are not work to add unless the task itself asks for them.`;
 }
 
-/** Fallback prompt for the blind single-call planner (no tools). */
-export function blindPlannerPrompt(maxSteps: number): string {
+/**
+ * Fallback prompt for the blind single-call planner (no tools). When `micro`
+ * (config "microtasks": true) the one-unit-of-work paragraph is replaced
+ * with the microPlannerGuidance section; everything else is identical.
+ */
+export function blindPlannerPrompt(maxSteps: number, micro = false): string {
 	return `You are a DAG planner. Decompose the user's request into fine-grained, verifiable steps that can be executed by isolated coding subagents: 1-3 for small, focused changes, up to ${maxSteps} for large multi-module tasks.
 
-One unit of work per step: usually one new file, or one tightly-coupled file plus its tests, and at most one feature. A step that creates 2+ substantial files or implements 2+ distinct features is too big — split it into separate steps linked by dependsOn. Prefer more, smaller steps over fewer, larger ones (independent steps run in parallel, so finer granularity rarely costs wall-clock). Keep each step prompt under ~150 words, ending with the exact command that verifies the step.
+${
+	micro
+		? microPlannerGuidance(maxSteps)
+		: "One unit of work per step: usually one new file, or one tightly-coupled file plus its tests, and at most one feature. A step that creates 2+ substantial files or implements 2+ distinct features is too big — split it into separate steps linked by dependsOn. Prefer more, smaller steps over fewer, larger ones (independent steps run in parallel, so finer granularity rarely costs wall-clock). Keep each step prompt under ~150 words, ending with the exact command that verifies the step."
+}
 
 Maximize parallelism: only add a "dependsOn" edge when a step genuinely needs another step's output. Each "prompt" must be self-contained — subagents share NO conversation context: state the goal, the concrete task, relevant file paths and commands, expected artifacts, and how to report results.
 
@@ -188,7 +246,8 @@ export async function loadPlannerInstructions(cwd?: string): Promise<string | un
  * --tools is a strict allow-list that would otherwise hide the extensions'
  * extra tools — the explore tool stays loaded (with the default tool set it
  * remains available). `config.maxSteps` (soft cap, default
- * DEFAULT_MAX_STEPS) is interpolated into the prompt.
+ * DEFAULT_MAX_STEPS) is interpolated into the prompt, which switches to the
+ * microPlannerGuidance step-size rules when `config.microtasks` is on.
  */
 export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions", "--no-skills", "--no-context-files"];
@@ -198,7 +257,7 @@ export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, con
 	args.push("--model", modelLabel);
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	for (const ext of plannerExtensions) args.push("-e", ext);
-	args.push("--system-prompt", plannerSystemPrompt(getMaxSteps(config)));
+	args.push("--system-prompt", plannerSystemPrompt(getMaxSteps(config), config?.microtasks === true));
 	return args;
 }
 
@@ -207,13 +266,15 @@ export function buildPlannerArgs(modelLabel: string, thinkingLevel?: string, con
  * single tool-less completion — no tools, no extensions/skills/context
  * files, its own system prompt. `modelLabel` and `thinkingLevel` come from
  * config "plannerModel"/"plannerThinking" when set, else the session's
- * current model and thinking level (the host resolves the defaults).
+ * current model and thinking level (the host resolves the defaults). The
+ * system prompt switches to the microPlannerGuidance step-size rules when
+ * `config.microtasks` is on.
  */
 export function buildBlindPlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	args.push("--no-extensions", "--no-skills", "--no-context-files", "--no-tools");
-	args.push("--system-prompt", blindPlannerPrompt(getMaxSteps(config)));
+	args.push("--system-prompt", blindPlannerPrompt(getMaxSteps(config), config?.microtasks === true));
 	return args;
 }
 
@@ -328,11 +389,14 @@ function extractAndValidate(text: string, cfg: DagPlanConfig): ExtractedPlan {
  * Extra guidance appended to retry feedback. "Unterminated string" is the
  * signature of output truncation (the model hit its max output tokens
  * mid-JSON); a plain re-roll with the same prompt truncates again, so tell
- * the planner to be more concise.
+ * the planner to be more concise. The per-prompt word target is the usual
+ * STEP_PROMPT_TARGET_WORDS, or the relaxed MICRO_STEP_PROMPT_TARGET_WORDS
+ * in microtasks mode.
  */
-function retryHintFor(feedback: string): string | undefined {
+function retryHintFor(feedback: string, micro = false): string | undefined {
 	if (/unterminated string/i.test(feedback)) {
-		return "Your previous response was cut off before the JSON was complete (likely a max-output-token limit). Respond with a more concise plan: keep the same step structure but shorten each step prompt (aim ≤150 words each; drop detail the subagent can discover itself).";
+		const target = micro ? MICRO_STEP_PROMPT_TARGET_WORDS : STEP_PROMPT_TARGET_WORDS;
+		return `Your previous response was cut off before the JSON was complete (likely a max-output-token limit). Respond with a more concise plan: keep the same step structure but shorten each step prompt (aim ≤${target} words each; drop detail the subagent can discover itself).`;
 	}
 	return undefined;
 }
@@ -410,7 +474,7 @@ export async function plan(
 	if (opts.priorPlanJson)
 		parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
 	if (opts.feedback) {
-		const hint = retryHintFor(opts.feedback);
+		const hint = retryHintFor(opts.feedback, cfg.microtasks === true);
 		parts.push(
 			`Address this feedback / error from the previous attempt:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond again with ONLY the revised JSON plan.`,
 		);

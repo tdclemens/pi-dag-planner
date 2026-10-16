@@ -11,6 +11,7 @@ import {
 	blindPlannerPrompt,
 	extractPlanJson,
 	loadPlannerInstructions,
+	microPlannerGuidance,
 	normalizePlan,
 	PlanError,
 	plannerExplores,
@@ -22,7 +23,7 @@ import {
 	PLANNER_INSTRUCTIONS_FILE,
 } from "../src/planner.ts";
 import { EXPLORE_TOOL_PATH } from "../src/explore-tool.ts";
-import { DEFAULT_MAX_STEPS } from "../src/dag.ts";
+import { DEFAULT_MAX_STEPS, MICRO_STEP_PROMPT_TARGET_WORDS } from "../src/dag.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { emptyUsage } from "../src/types.ts";
 
@@ -797,4 +798,156 @@ test("plan() caps very large prior output, keeping the tail", async () => {
 	assert.match(capturedText!, /earlier output elided/);
 	assert.ok(capturedText!.includes("TAIL-MARKER"), "tail kept");
 	assert.ok(!capturedText!.includes("HEAD-MARKER"), "head elided");
+});
+
+// ---------------------------------------------------------------------------
+// Microtasks mode (config microtasks: true): the planner switches to the
+// ultra-granular micro-guidance and the step-prompt length is relaxed
+// ---------------------------------------------------------------------------
+
+test("microPlannerGuidance declares the mode and keeps the four sections", () => {
+	const g = microPlannerGuidance(20);
+	assert.match(g, /^You are in microtasks mode/m, "identity sentence reworded into a mode declaration");
+	assert.match(g, /Core Philosophy: The Micro-Task Delta/);
+	assert.match(g, /Concurrency & Dependency Optimization/);
+	assert.match(g, /Self-Contained Step Prompts/);
+	assert.match(g, /Execution Limits/);
+	assert.match(g, /Minimize the Delta/);
+	assert.match(g, /Single Responsibility/);
+	assert.match(g, /flat, wide DAG layout/i, "flat/wide-DAG bullet kept");
+	assert.match(g, /must not exceed 20 steps/, "concrete step-count bound");
+	assert.match(g, /un-splittable atomic file modification/i, "group-only-when-un-splittable bullet kept");
+	assert.match(g, new RegExp(`≤${MICRO_STEP_PROMPT_TARGET_WORDS} words`), "relaxed length target");
+	assert.match(g, /exactly what to look for in its prerequisite inputs/, "self-contained prerequisite guidance");
+});
+
+test("micro agentic prompt contains the micro guidance and drops the one-unit-of-work step-size rule", () => {
+	const prompt = plannerSystemPrompt(12, true);
+	assert.match(prompt, /Micro-Task Delta/i);
+	assert.match(prompt, /Minimize the Delta/i);
+	assert.match(prompt, /Single Responsibility/i);
+	assert.match(prompt, /Monolithic Steps are Forbidden/i);
+	assert.match(prompt, /Isolate Side Effects/i);
+	assert.match(prompt, /Explicit Data Flow/i);
+	assert.match(prompt, /completely self-contained/i);
+	assert.match(prompt, /exactly what to look for in its prerequisite inputs/i);
+	assert.match(prompt, /flat, wide DAG layout/i);
+	assert.match(prompt, /must not exceed 12 steps/);
+	assert.match(prompt, new RegExp(`≤${MICRO_STEP_PROMPT_TARGET_WORDS} words`), "relaxed 300-word target");
+	assert.match(prompt, /~150-word target/, "the usual 150 target named as the relaxed-from baseline");
+	assert.doesNotMatch(prompt, /~150 words/i, "old ~150-words line replaced");
+	assert.doesNotMatch(prompt, /one unit of work per step/i, "old step-size rule replaced");
+	assert.doesNotMatch(prompt, /2\+ substantial files/i, "old split rule replaced");
+	assert.doesNotMatch(prompt, /Split aggressively/i, "old sub-bullets replaced");
+	assert.doesNotMatch(prompt, /end green/i, "old sub-bullets replaced");
+	// everything else in the agentic prompt stays
+	assert.match(prompt, /explore the repository/i);
+	assert.match(prompt, /decompose before writing any JSON/i);
+	assert.match(prompt, /Rules:/);
+	assert.match(prompt, /"dependsOn" lists ids of prerequisite steps/);
+	assert.match(prompt, /verification is required/i);
+	assert.match(prompt, /ONLY a JSON object/i);
+	assert.match(prompt, /PLAN\.md/);
+});
+
+test("micro blind prompt contains the micro guidance and drops the one-unit-of-work paragraph", () => {
+	const prompt = blindPlannerPrompt(12, true);
+	assert.match(prompt, /Micro-Task Delta/i);
+	assert.match(prompt, /Monolithic Steps are Forbidden/i);
+	assert.match(prompt, /completely self-contained/i);
+	assert.match(prompt, /exactly what to look for in its prerequisite inputs/i);
+	assert.match(prompt, /must not exceed 12 steps/);
+	assert.match(prompt, new RegExp(`≤${MICRO_STEP_PROMPT_TARGET_WORDS} words`), "relaxed 300-word target");
+	assert.doesNotMatch(prompt, /~150 words/i, "old paragraph replaced");
+	assert.doesNotMatch(prompt, /One unit of work per step/i, "old paragraph replaced");
+	// everything else in the blind prompt stays
+	assert.match(prompt, /ONLY a JSON object/i);
+	assert.match(prompt, /Maximize parallelism/i);
+	assert.match(prompt, /serialized at run time/i);
+	assert.match(prompt, /never invent steps/i);
+	assert.match(prompt, /PLAN\.md/);
+});
+
+test("non-micro prompts are unchanged (micro defaults to false)", () => {
+	for (const p of [plannerSystemPrompt(12), blindPlannerPrompt(12)]) {
+		assert.match(p, /~150 words/);
+		assert.doesNotMatch(p, /Micro-Task Delta/i);
+		assert.doesNotMatch(p, /microtasks mode/i);
+	}
+	assert.equal(plannerSystemPrompt(12), plannerSystemPrompt(12, false), "explicit micro=false is the default");
+	assert.equal(blindPlannerPrompt(12), blindPlannerPrompt(12, false), "explicit micro=false is the default");
+});
+
+test("buildPlannerArgs emits the micro system prompt when microtasks is on", () => {
+	const on = buildPlannerArgs("p/m", "medium", { ...DEFAULT_CONFIG, maxSteps: 12, microtasks: true });
+	assert.equal(on[on.indexOf("--system-prompt") + 1], plannerSystemPrompt(12, true));
+	const off = buildPlannerArgs("p/m", "medium", { ...DEFAULT_CONFIG, maxSteps: 12, microtasks: false });
+	assert.equal(off[off.indexOf("--system-prompt") + 1], plannerSystemPrompt(12), "off (default) keeps the usual prompt");
+});
+
+test("buildBlindPlannerArgs emits the micro system prompt when microtasks is on", () => {
+	const on = buildBlindPlannerArgs("p/m", "high", { ...DEFAULT_CONFIG, maxSteps: 12, microtasks: true });
+	assert.equal(on[on.indexOf("--system-prompt") + 1], blindPlannerPrompt(12, true));
+	const off = buildBlindPlannerArgs("p/m", "high", { ...DEFAULT_CONFIG, maxSteps: 12, microtasks: false });
+	assert.equal(off[off.indexOf("--system-prompt") + 1], blindPlannerPrompt(12), "off (default) keeps the usual prompt");
+});
+
+test("plan() with a microtasks config spawns the exploring planner with the micro system prompt", async () => {
+	let capturedArgs: string[] | undefined;
+	await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, microtasks: true },
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(capturedArgs, "planner subprocess spawned");
+	assert.equal(
+		capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1],
+		plannerSystemPrompt(DEFAULT_MAX_STEPS, true),
+		"microtasks config → the micro system prompt",
+	);
+});
+
+test("plan() blind path with a microtasks config uses the micro blind system prompt", async () => {
+	let capturedArgs: string[] | undefined;
+	await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false, microtasks: true },
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(capturedArgs, "blind planner subprocess spawned");
+	assert.equal(
+		capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1],
+		blindPlannerPrompt(DEFAULT_MAX_STEPS, true),
+		"microtasks config → the micro blind system prompt",
+	);
+});
+
+test("plan() retry conciseness hint uses the relaxed word target in microtasks mode", async () => {
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "x", {
+		config: { ...DEFAULT_CONFIG, microtasks: true },
+		feedback: "planner output is not a valid plan JSON (Unterminated string in JSON at position 5)",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.match(capturedText!, /aim ≤300 words each/i, "relaxed micro target in the truncation hint");
+	assert.doesNotMatch(capturedText!, /aim ≤150 words each/i, "the usual target is not used in micro mode");
+});
+
+test("plan() retry conciseness hint keeps the usual word target outside microtasks mode", async () => {
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "x", {
+		feedback: "planner output is not a valid plan JSON (Unterminated string in JSON at position 5)",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.match(capturedText!, /aim ≤150 words each/i, "normal target unchanged");
 });

@@ -204,6 +204,8 @@ export interface DagPlanDetails {
 	planPath: string;
 	/** Wall-clock time of the DAG Plan phase (incl. retries), if known. */
 	planDurationMs?: number;
+	/** Plan drafted with config `microtasks: true` (ultra-granular micro-step mode). */
+	microtasks?: boolean;
 	/** Non-fatal validation warnings (e.g. unordered touches overlap). */
 	warnings?: string[];
 	/** Resume: ids of the steps already completed in a prior run. */
@@ -228,7 +230,8 @@ export function renderPlanMessage(
 
 	const { plan, planPath } = details;
 	const lines: string[] = [];
-	lines.push(theme.fg("accent", theme.bold(`DAG Plan — ${plan.steps.length} steps`)));
+	const microTag = details.microtasks === true ? " (microtasks)" : "";
+	lines.push(theme.fg("accent", theme.bold(`DAG Plan — ${plan.steps.length} steps${microTag}`)));
 	lines.push(theme.fg("dim", plan.goal));
 
 	let waves: DagNode[][];

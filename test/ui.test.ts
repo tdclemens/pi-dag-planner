@@ -505,3 +505,34 @@ test("renderPlanMessage marks already-done steps and shows the resume footer", (
 	assert.ok(text.includes("Resuming: /home/u/.agents/plans/x.md — 1 done, 1 to run"), text);
 	assert.ok(!text.includes("Plan saved:"), text);
 });
+
+test("renderPlanMessage tags the header when the plan was drafted in microtasks mode", () => {
+	const msg = {
+		content: "DAG Plan — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md", microtasks: true },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const header = comp.render(W).find((l) => l.includes("DAG Plan"))!;
+	assert.equal(header.trim(), "DAG Plan — 2 steps (microtasks)", header);
+});
+
+test("renderPlanMessage leaves the header plain when microtasks is absent or false", () => {
+	// Field absent (e.g. older sessions / microtasks off): exact header as before.
+	const comp = renderPlanMessage(
+		{ content: "DAG Plan — test goal (2 steps)", details: { plan, planPath: "/home/u/.agents/plans/x.md" } } as never,
+		{ expanded: false, outputPad: 0 },
+		theme,
+	);
+	const header = comp.render(W).find((l) => l.includes("DAG Plan"))!;
+	assert.equal(header.trim(), "DAG Plan — 2 steps", header);
+	assert.ok(!comp.render(W).join("\n").includes("(microtasks)"), "tag must not appear anywhere in the card");
+
+	// Explicit false behaves the same as absent.
+	const comp2 = renderPlanMessage(
+		{ content: "DAG Plan — test goal (2 steps)", details: { plan, planPath: "/home/u/.agents/plans/x.md", microtasks: false } } as never,
+		{ expanded: false, outputPad: 0 },
+		theme,
+	);
+	const header2 = comp2.render(W).find((l) => l.includes("DAG Plan"))!;
+	assert.equal(header2.trim(), "DAG Plan — 2 steps", header2);
+});

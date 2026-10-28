@@ -427,6 +427,13 @@ export async function plan(
 		cfg,
 		spawnImpl: opts.spawnImpl,
 		onToolCall: exploring ? (toolName, argsObj) => opts.onExplore?.(formatSnippetPlain(toolName, argsObj)) : undefined,
+		// Same silent-window blind spot as the run dashboard: while the
+		// exploring planner's context compacts (or the model generates), the
+		// loader's snippet line would otherwise sit on a stale tool call.
+		onMessageStart: exploring ? () => opts.onExplore?.("thinking…") : undefined,
+		onCompaction: exploring
+			? (phase, { reason }) => opts.onExplore?.(phase === "start" ? `compacting context…${reason ? ` (${reason})` : ""}` : "thinking…")
+			: undefined,
 	});
 }
 
@@ -490,6 +497,8 @@ async function runPlannerSubagent(opts: {
 	cfg: DagPlanConfig;
 	spawnImpl?: PlanOptions["spawnImpl"];
 	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
+	onMessageStart?: () => void;
+	onCompaction?: (phase: "start" | "end", details: { reason?: string; error?: string }) => void;
 }): Promise<PlannerResult | null> {
 	const run = await runPiSubagent({
 		cwd: opts.cwd,
@@ -498,6 +507,8 @@ async function runPlannerSubagent(opts: {
 		prompt: opts.userText,
 		spawnImpl: opts.spawnImpl,
 		onToolCall: opts.onToolCall,
+		onMessageStart: opts.onMessageStart,
+		onCompaction: opts.onCompaction,
 	});
 	if (opts.signal?.aborted || run.wasAborted) return null;
 	if (run.exitCode !== 0 || run.stopReason === "error") {

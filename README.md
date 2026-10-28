@@ -28,7 +28,7 @@ DAG Plan — 4 steps
 
 - **DAG plans** — the model drafts self-contained steps with explicit dependencies; plans are validated against a JSON Schema (draft 2020-12, ajv) plus DAG rules (unique ids, known deps, no cycles) before anything runs.
 - **Parallel execution** — a ready-set scheduler (Kahn's algorithm) runs every node whose dependencies are complete, up to `maxParallel` at a time (default 4). Set `parallel: false` for strict sequential mode.
-- **Live feedback** — a runner panel shows per-node status, durations, and command snippets; each finished node appends a result card to the transcript and to the plan file.
+- **Live feedback** — a runner panel shows per-node status, durations, and what each node is doing right now: the latest command, `thinking…` while the model generates, and `compacting context…` while the subagent compresses its own context; each finished node appends a result card to the transcript and to the plan file.
 - **Safe concurrency** — three layers keep parallel nodes from corrupting shared files (see [How it works](#how-it-works)).
 - **Durable records** — plans save to `~/.agents/plans/` as markdown with the exact JSON and post-run results, plus a run-state sidecar for resume.
 - **Refine loop** — steer the plan before spending tokens on execution (up to 3 refine rounds).
@@ -97,7 +97,7 @@ The intended loop: `init` → commit baseline → edit `PRODUCT.md` → `/dag-co
 
 **Scheduler.** A worker pool runs every node whose dependencies are complete. `touches` are mutex-protected at the scheduler: a node holds its declared files/resources for its whole run, and a ready node whose touches collide stays pending (named in the runner panel) until the holder finishes.
 
-**Nodes.** Each node is an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus truncated outputs of its prerequisites. Each report must end with `STATUS: success` or `STATUS: failure — <reason>`. Transient failures (crash, API error, truncated/empty response) auto-retry once with the failure reason fed back; an agent-reported task failure is not retried — the node is marked failed, its dependents skipped, and the rest of the graph continues.
+**Nodes.** Each node is an isolated `pi --mode json -p --no-session` subprocess running the node's prompt plus truncated outputs of its prerequisites. Each report must end with `STATUS: success` or `STATUS: failure — <reason>`. Transient failures (crash, API error, truncated/empty response) auto-retry once with the failure reason fed back; an agent-reported task failure is not retried — the node is marked failed, its dependents skipped, and the rest of the graph continues. A node is a full pi session, so long-running steps whose context grows past the model's reserve compact internally mid-run (a summarization call pi makes on its own); the runner panel surfaces that window as `compacting context…` instead of appearing frozen, and the result card records how many times it happened.
 
 **Conflict safety.** Parallel nodes write in the same working directory, so three defenses apply:
 

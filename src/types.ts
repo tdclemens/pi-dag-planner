@@ -89,8 +89,21 @@ export interface NodeResult {
 	status: NodeStatus;
 	startedAt?: number;
 	finishedAt?: number;
-	/** Tool invocations observed during the run (capped). */
+	/**
+	 * Tool invocations observed during the run — the most recent 200 are
+	 * retained (a ring buffer: live `snippet` events are unbounded, but the
+	 * persisted result is — transcript card, plan file, run-state sidecar).
+	 * `toolCalls` holds the true total.
+	 */
 	snippets: ToolSnippet[];
+	/** Total tool invocations observed during the run (may exceed `snippets.length`). */
+	toolCalls?: number;
+	/**
+	 * Context compactions the subagent performed while running. Each is a
+	 * long, otherwise-silent window (a summarization LLM call) — the count
+	 * explains both the pause and any odd context behavior in the report.
+	 */
+	compactions?: number;
 	/** Final assistant output; "" for nodes that never ran. */
 	output: string;
 	/** Error message (model error, stderr excerpt) for failed nodes. */
@@ -119,6 +132,21 @@ export interface PlannerResult {
 export type DagEvent =
 	| { type: "node-start"; nodeId: string }
 	| { type: "snippet"; nodeId: string; snippet: ToolSnippet }
+	/**
+	 * The node's subagent is compacting its context (a long, otherwise-silent
+	 * window: pi runs a summarization LLM call before the next model request,
+	 * during which no tool calls or messages stream). `phase` mirrors the
+	 * stream's compaction_start/compaction_end events; `reason` is the trigger
+	 * ("threshold" = projected context crossed the model's reserve,
+	 * "overflow" = a model call failed on context size) when known.
+	 */
+	| { type: "node-compaction"; nodeId: string; phase: "start" | "end"; reason?: string }
+	/**
+	 * The node's model is generating a response (true) or a tool call has
+	 * started again (false). Lets the dashboard show "thinking…" instead of
+	 * a stale command line while the model thinks between tool calls.
+	 */
+	| { type: "node-thinking"; nodeId: string; thinking: boolean }
 	/**
 	 * A ready node is held back because a running node holds one of its
 	 * declared `touches`. Emitted only when the blocking resource/holder

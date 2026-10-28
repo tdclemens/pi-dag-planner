@@ -409,8 +409,16 @@ export function renderNodeCard(
 	for (const s of snippets) {
 		container.addChild(new Text(theme.fg("muted", "→ ") + formatSnippet(s.toolName, s.args, theme.fg.bind(theme)), 0, 0));
 	}
-	if (!expanded && data.snippets.length > 4) {
-		container.addChild(new Text(theme.fg("dim", `… ${data.snippets.length - 4} earlier`), 0, 0));
+	// "Earlier" count uses the true total when the run made more tool calls
+	// than the retention cap kept (the persisted snippets are a most-recent
+	// ring buffer, so a marathon node shows the gap honestly).
+	const total = data.toolCalls ?? data.snippets.length;
+	const shown = expanded ? data.snippets.length : Math.min(4, data.snippets.length);
+	const earlier = total - shown;
+	if (earlier > 0) {
+		const dropped = Math.max(0, total - data.snippets.length);
+		const capNote = dropped > 0 ? ` — only the most recent ${data.snippets.length} retained` : "";
+		container.addChild(new Text(theme.fg("dim", `… ${earlier} earlier call${earlier > 1 ? "s" : ""}${capNote}`), 0, 0));
 	}
 
 	if (data.status === "skipped" && data.skipReason) {
@@ -430,6 +438,9 @@ export function renderNodeCard(
 	}
 
 	const usageLine = formatUsageStats(data.usage, data.model);
+	if (data.compactions) {
+		container.addChild(new Text(theme.fg("dim", `compacted context ${data.compactions}×`), 0, 0));
+	}
 	if (usageLine) container.addChild(new Text(theme.fg("dim", usageLine), 0, 0));
 	if (!expanded && (data.output.length > 300 || data.snippets.length > 4)) {
 		container.addChild(new Text(theme.fg("dim", "(Ctrl+O: full output)"), 0, 0));
@@ -444,6 +455,10 @@ export function renderNodeCard(
 interface DashboardRow {
 	status: NodeStatus;
 	snippet?: ToolSnippet;
+	/** The node's subagent is compacting its context (a long, silent window). */
+	compacting?: { reason?: string };
+	/** The node's model is generating a response (between tool calls). */
+	thinking?: boolean;
 	startedAt?: number;
 	finishedAt?: number;
 	/** File-lock serialization: this pending node waits on the resource. */
@@ -501,6 +516,8 @@ export class RunDashboard implements Component {
 		attempt?: number;
 		maxAttempts?: number;
 		reason?: string;
+		phase?: "start" | "end";
+		thinking?: boolean;
 	}): void {
 		const row = event.nodeId ? this.rows.get(event.nodeId) : undefined;
 		if (!row) return;
@@ -510,8 +527,16 @@ export class RunDashboard implements Component {
 			row.blockedBy = undefined;
 			row.retry = undefined;
 			row.retries = undefined;
+			row.compacting = undefined;
+			row.thinking = undefined;
 		} else if (event.type === "snippet" && event.snippet) {
 			row.snippet = event.snippet;
+			row.thinking = undefined; // a tool call is now visible
+		} else if (event.type === "node-thinking" && event.thinking !== undefined) {
+			row.thinking = event.thinking;
+		} else if (event.type === "node-compaction" && event.phase) {
+			row.compacting = event.phase === "start" ? { reason: event.reason } : undefined;
+			row.thinking = undefined; // compaction is the more specific state
 		} else if (event.type === "node-blocked" && event.resource && event.heldBy) {
 			row.blockedBy = { resource: event.resource, heldBy: event.heldBy };
 		} else if (event.type === "node-retry" && event.attempt !== undefined) {
@@ -526,6 +551,8 @@ export class RunDashboard implements Component {
 			row.finishedAt = event.result.finishedAt ?? Date.now();
 			row.retry = undefined;
 			row.retries = event.result.retries;
+			row.compacting = undefined;
+			row.thinking = undefined;
 			if (event.result.snippets.length > 0) row.snippet = event.result.snippets[event.result.snippets.length - 1];
 		}
 		this.cachedWidth = undefined;
@@ -600,8 +627,18 @@ export class RunDashboard implements Component {
 					const retry = row.retry
 						? t.fg("warning", ` (retry ${row.retry.attempt}/${row.retry.maxAttempts}: ${truncate(row.retry.reason, 48)})`)
 						: "";
-					const snippet = row.snippet ? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t)) : t.fg("dim", "…");
-					line = `${glyph} ${id}  ${node.title}${retry}  ${snippet}`;
+					// What the node is doing right now, most specific first: a
+					// compaction hides the last command line (the subagent is in a
+					// summarization call, not running that command), and thinking
+					// beats a stale snippet (the model is generating).
+					const activity = row.compacting
+						? t.fg("warning", "compacting context…") + (row.compacting.reason ? t.fg("muted", ` (${row.compacting.reason})`) : "")
+						: row.thinking
+							? t.fg("dim", "thinking…")
+							: row.snippet
+								? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t))
+								: t.fg("dim", "…");
+					line = `${glyph} ${id}  ${node.title}${retry}  ${activity}`;
 					break;
 				}
 				case "done": {

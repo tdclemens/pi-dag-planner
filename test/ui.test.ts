@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager } from "@earendil-works/pi-tui";
-import { formatSnippet, formatSnippetPlain, reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
+import { formatSnippet, formatSnippetPlain, renderNodeCard, reportExcerpt, renderPlanMessage, renderPlanSummary, RunDashboard } from "../src/ui.ts";
 import type { DagEvent, DagPlan, NodeResult } from "../src/types.ts";
 import { emptyUsage } from "../src/types.ts";
 
@@ -186,6 +186,41 @@ test("running row shows latest command snippet", () => {
 	assert.ok(!row.includes("ls src/"), "only the latest snippet should be shown");
 });
 
+test("running row shows the compaction window, then reverts to the latest snippet", () => {
+	const { dashboard, emit } = makeDashboard();
+	emit({ type: "node-start", nodeId: "a" });
+	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "bash", args: { command: "npm test" } } });
+	emit({ type: "node-compaction", nodeId: "a", phase: "start", reason: "threshold" });
+	let row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("compacting context…"), row);
+	assert.ok(row.includes("threshold"), row);
+	assert.ok(!row.includes("npm test"), "a stale command must not imply that command is still running");
+
+	emit({ type: "node-compaction", nodeId: "a", phase: "end" });
+	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("npm test"), row);
+	assert.ok(!row.includes("compacting"), row);
+});
+
+test("running row shows thinking while the model generates, and reverts on a tool call", () => {
+	const { dashboard, emit } = makeDashboard();
+	emit({ type: "node-start", nodeId: "a" });
+	let row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(!row.includes("thinking"), row);
+
+	emit({ type: "node-thinking", nodeId: "a", thinking: true });
+	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("thinking…"), row);
+
+	emit({ type: "node-thinking", nodeId: "a", thinking: false });
+	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "bash", args: { command: "npm test" } } });
+	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("npm test"), row);
+	assert.ok(!row.includes("thinking"), row);
+
+	assert.ok(dashboard.render(W)[0].includes("1 running"), dashboard.render(W)[0]);
+});
+
 test("done row shows checkmark and duration", () => {
 	const { dashboard, emit } = makeDashboard();
 	emit({ type: "node-start", nodeId: "a" });
@@ -341,6 +376,51 @@ test("reportExcerpt: truncated to maxChars with ellipsis", () => {
 	const out = reportExcerpt(result({ id: "a", status: "done", output: "x".repeat(300) }), 200);
 	assert.equal(out.length, 201);
 	assert.ok(out.endsWith("…"), out);
+});
+
+// ---------------------------------------------------------------------------
+// renderNodeCard (transcript card)
+// ---------------------------------------------------------------------------
+
+test("node card: earlier-call count uses the true total and notes the retention cap", () => {
+	const data = result({
+		id: "a",
+		status: "done",
+		output: "ok",
+		snippets: Array.from({ length: 200 }, (_, i) => ({ toolName: "bash", args: { command: `c${i}` } })),
+		toolCalls: 500,
+	});
+	const collapsed = renderNodeCard({ data } as never, { expanded: false }, theme).render(W).join("\n");
+	assert.ok(collapsed.includes("… 496 earlier calls"), collapsed);
+	assert.ok(collapsed.includes("only the most recent 200 retained"), collapsed);
+	const expanded = renderNodeCard({ data } as never, { expanded: true }, theme).render(W).join("\n");
+	assert.ok(expanded.includes("… 300 earlier calls"), expanded);
+});
+
+test("node card: earlier-call count falls back to retained snippets for older runs (no toolCalls)", () => {
+	const data = result({
+		id: "a",
+		status: "done",
+		output: "ok",
+		snippets: Array.from({ length: 6 }, (_, i) => ({ toolName: "bash", args: { command: `c${i}` } })),
+	});
+	const collapsed = renderNodeCard({ data } as never, { expanded: false }, theme).render(W).join("\n");
+	assert.ok(collapsed.includes("… 2 earlier calls"), collapsed);
+	assert.ok(!collapsed.includes("retained"), collapsed);
+});
+
+test("node card: shows the context-compaction count", () => {
+	const data = result({
+		id: "a",
+		status: "done",
+		output: "ok",
+		compactions: 2,
+	});
+	const text = renderNodeCard({ data } as never, { expanded: true }, theme).render(W).join("\n");
+	assert.ok(text.includes("compacted context 2×"), text);
+	// No compactions → no line (covers older runs too).
+	const plain = renderNodeCard({ data: { ...data, compactions: undefined } } as never, { expanded: true }, theme).render(W).join("\n");
+	assert.ok(!plain.includes("compacted context"), plain);
 });
 
 // ---------------------------------------------------------------------------

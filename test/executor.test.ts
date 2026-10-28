@@ -373,6 +373,119 @@ test("runPlan still marks a node done when it made tool calls and stopped cleanl
 	assert.equal(results[0]!.snippets.length, 1);
 });
 
+// --- live activity events (dashboard liveness) -------------------------------
+
+test("runPlan emits node-thinking and node-compaction events for the dashboard", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => {
+			const lines = [
+				{ type: "message_start", message: { role: "assistant" } },
+				{ type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: { command: "npm test" } },
+				// A non-assistant message must not count as model activity.
+				{ type: "message_start", message: { role: "toolResult" } },
+				{ type: "compaction_start", reason: "threshold" },
+				{
+					type: "compaction_end",
+					reason: "threshold",
+					result: { summary: "s", preTokens: 100, messagesSummarized: 5 },
+					aborted: false,
+					willRetry: false,
+				},
+				{ type: "message_start", message: { role: "assistant" } },
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						model: "test/model",
+						content: [{ type: "text", text: "Built the engine." }],
+						usage: { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 140, cost: { total: 0.001 } },
+					},
+				},
+			];
+			record.proc.stdout.emit("data", Buffer.from(lines.map((l) => JSON.stringify(l)).join("\n") + "\n"));
+			setImmediate(() => record.proc.emit("close", 0));
+		},
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	assert.equal(results[0]!.status, "done");
+	assert.equal(results[0]!.toolCalls, 1);
+	assert.equal(results[0]!.compactions, 1);
+
+	// Model activity toggles: before the first tool call, off on tool start,
+	// on again after compaction for the final (report) message.
+	const thinking = events.filter((e) => e.type === "node-thinking").map((e) => (e as { thinking: boolean }).thinking);
+	assert.deepEqual(thinking, [true, false, true]);
+	// The compaction window is surfaced with its trigger reason.
+	const compaction = events
+		.filter((e) => e.type === "node-compaction")
+		.map((e) => {
+			const c = e as Extract<DagEvent, { type: "node-compaction" }>;
+			return [c.phase, c.reason] as const;
+		});
+	assert.deepEqual(compaction, [
+		["start", "threshold"],
+		["end", "threshold"],
+	]);
+	// Ordering: the window sits between tool activity and node end.
+	const iThinking = events.findIndex((e) => e.type === "node-thinking");
+	const iSnippet = events.findIndex((e) => e.type === "snippet");
+	const iCompaction = events.findIndex((e) => e.type === "node-compaction");
+	const iEnd = events.findIndex((e) => e.type === "node-end");
+	assert.ok(iThinking < iSnippet, `thinking should precede the first tool call (got ${iThinking}, ${iSnippet})`);
+	assert.ok(iSnippet < iCompaction && iCompaction < iEnd, `compaction window mis-ordered (snippet=${iSnippet}, compaction=${iCompaction}, end=${iEnd})`);
+});
+
+test("runPlan keeps emitting live snippets past the retention cap (ring buffer)", async () => {
+	const plan: DagPlan = { goal: "g", steps: [node("s1")] };
+	const h = makeHarness({
+		program: (record) => {
+			const lines: string[] = [];
+			for (let i = 0; i < 205; i++) {
+				lines.push(JSON.stringify({ type: "tool_execution_start", toolCallId: String(i), toolName: "bash", args: { command: `cmd ${i}` } }));
+			}
+			lines.push(
+				JSON.stringify({
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						model: "test/model",
+						content: [{ type: "text", text: "Done." }],
+						usage: { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 140, cost: { total: 0.001 } },
+					},
+				}),
+			);
+			record.proc.stdout.emit("data", Buffer.from(lines.join("\n") + "\n"));
+			setImmediate(() => record.proc.emit("close", 0));
+		},
+	});
+	const { events, onEvent } = collectEvents();
+	const results = await runPlan(plan, {
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		spawnImpl: h.spawnImpl,
+		onEvent,
+	});
+	const live = events.filter((e) => e.type === "snippet");
+	assert.equal(live.length, 205, "live snippet events must not be capped");
+	const last = live[live.length - 1] as Extract<DagEvent, { type: "snippet" }>;
+	assert.equal(last.snippet.args.command, "cmd 204");
+	const r = results[0]!;
+	assert.equal(r.snippets.length, 200, "retained snippets are capped");
+	assert.equal(r.snippets[0]!.args.command, "cmd 5", "oldest retained calls are evicted first");
+	assert.equal(r.snippets[199]!.args.command, "cmd 204");
+	assert.equal(r.toolCalls, 205, "the true total is tracked separately");
+	assert.equal(r.status, "done");
+});
+
 // --- auto-retry of transient failures ----------------------------------------
 
 test("getMaxRetries reads the config cap (default 1)", () => {
@@ -803,6 +916,53 @@ test("runPiSubagent collects output, usage, and live tool calls", async () => {
 	const [rec] = h.spawns;
 	assert.equal(rec.args[rec.args.length - 1], "PLAN THIS");
 	assert.equal(rec.cwd, "/tmp/x");
+});
+
+test("runPiSubagent surfaces compaction and assistant message-start events", async () => {
+	const h = makeHarness({
+		program: (record) => {
+			const lines = [
+				{ type: "message_start", message: { role: "assistant" } },
+				{ type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: { command: "true" } },
+				// A non-assistant message must not count as model activity.
+				{ type: "message_start", message: { role: "toolResult" } },
+				{ type: "compaction_start", reason: "overflow" },
+				{
+					type: "compaction_end",
+					reason: "overflow",
+					result: { summary: "s", preTokens: 100, messagesSummarized: 2 },
+					aborted: false,
+					willRetry: false,
+				},
+				{ type: "message_start", message: { role: "assistant" } },
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						stopReason: "stop",
+						model: "test/model",
+						content: [{ type: "text", text: "final report" }],
+						usage: { input: 100, output: 40, cacheRead: 0, cacheWrite: 0, totalTokens: 140, cost: { total: 0.001 } },
+					},
+				},
+			];
+			record.proc.stdout.emit("data", Buffer.from(lines.map((l) => JSON.stringify(l)).join("\n") + "\n"));
+			setImmediate(() => record.proc.emit("close", 0));
+		},
+	});
+	const order: string[] = [];
+	const run = await runPiSubagent({
+		cwd: process.cwd(),
+		signal: new AbortController().signal,
+		args: ["--mode", "json", "-p", "--no-session"],
+		prompt: "do it",
+		spawnImpl: h.spawnImpl,
+		onToolCall: () => order.push("tool"),
+		onMessageStart: () => order.push("message-start"),
+		onCompaction: (phase, { reason }) => order.push(`compaction:${phase}${reason ? `:${reason}` : ""}`),
+	});
+	assert.equal(run.exitCode, 0);
+	assert.deepEqual(order, ["message-start", "tool", "compaction:start:overflow", "compaction:end:overflow", "message-start"]);
 });
 
 test("runPiSubagent captures stderr for failure diagnostics", async () => {

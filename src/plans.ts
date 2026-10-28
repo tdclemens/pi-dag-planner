@@ -144,7 +144,9 @@ export async function appendResults(planPath: string, results: NodeResult[], tot
 			}
 			if (r.snippets.length > 0) {
 				rows.push("Commands run:");
-				for (const s of r.snippets.slice(0, 50)) rows.push(`- ${formatSnippetLine(s.toolName, s.args)}`);
+				// The retained snippets are a most-recent ring buffer, so for
+				// long runs show the tail (what the step was doing last).
+				for (const s of r.snippets.slice(-50)) rows.push(`- ${formatSnippetLine(s.toolName, s.args)}`);
 				rows.push("");
 			}
 		}

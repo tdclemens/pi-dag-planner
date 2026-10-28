@@ -20,6 +20,13 @@ export const DEFAULT_MAX_PARALLEL = 4;
 export const DEFAULT_NODE_RETRIES = 1;
 const DEP_OUTPUT_PER_CAP = 8 * 1024;
 const DEP_OUTPUT_TOTAL_CAP = 16 * 1024;
+/**
+ * How many tool-call snippets a node result RETAINS — it is persisted in the
+ * transcript card, plan file, and run-state sidecar. Live `snippet` events
+ * are unbounded; the retained list is a most-recent ring buffer of this size
+ * (and `NodeResult.toolCalls` holds the true total). Capping only retention
+ * (not emission) is what keeps long-running nodes' dashboard rows alive.
+ */
 const MAX_SNIPPETS = 200;
 const KILL_GRACE_MS = 5000;
 const STDERR_CAP = 2000;
@@ -417,6 +424,20 @@ export interface PiSubagentOptions {
 	prompt: string;
 	/** Live tool-call observation (UI snippets / status line). */
 	onToolCall?: (toolName: string, args: Record<string, unknown>) => void;
+	/**
+	 * Live context-compaction observation. The stream's compaction_start /
+	 * compaction_end events bracket a long, otherwise-silent window: the
+	 * subagent's context grew past the model's compaction threshold (or a
+	 * model call overflowed), so pi runs a summarization LLM call before the
+	 * next request — emitting no tool calls and no messages. Without this
+	 * hook the UI would look stuck (or, worse, keep showing the last command
+	 * line as if it were still running).
+	 * `reason` is "threshold" or "overflow" when known; `error` is set on the
+	 * end phase when the compaction itself failed.
+	 */
+	onCompaction?: (phase: "start" | "end", details: { reason?: string; error?: string }) => void;
+	/** The subagent's model started generating an assistant response. */
+	onMessageStart?: () => void;
 	/** Extra env for the child, merged over process.env (e.g. DAG_NODE_ID). */
 	env?: Record<string, string>;
 	/**
@@ -458,6 +479,11 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 		}
 		if (event.type === "tool_execution_start" && event.toolName) {
 			opts.onToolCall?.(String(event.toolName), event.args && typeof event.args === "object" ? (event.args as Record<string, unknown>) : {});
+		} else if (event.type === "message_start" && event.message?.role === "assistant") {
+			// The model began generating (before the first tool call, and after
+			// each tool batch): a silent window for the UI — surfaced so the
+			// dashboard can show "thinking…" instead of a stale command line.
+			opts.onMessageStart?.();
 		} else if (event.type === "message_end" && event.message && event.message.role === "assistant") {
 			const msg = event.message as AssistantMessage;
 			result.lastAssistant = msg;
@@ -471,8 +497,23 @@ export async function runPiSubagent(opts: PiSubagentOptions): Promise<PiSubagent
 				.map((c) => c.text)
 				.join("\n");
 			if (text) result.output = text;
+		} else if (event.type === "compaction_start") {
+			// A long, otherwise-silent window: the subagent is summarizing its
+			// own context (an LLM call pi makes internally). Surface it so the
+			// UI doesn't appear frozen mid-step.
+			opts.onCompaction?.("start", { reason: streamString(event.reason) });
+		} else if (event.type === "compaction_end") {
+			opts.onCompaction?.("end", {
+				reason: streamString(event.reason),
+				error: streamString(event.errorMessage),
+			});
 		}
 	};
+
+/** Extract a non-empty string from a (loosely typed) stream-event field. */
+function streamString(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
 
 	const exitCode = await new Promise<number>((resolve) => {
 		let settled = false;
@@ -583,6 +624,16 @@ async function runNodeSubagent(
 		usage: emptyUsage(),
 	};
 
+	// Live-activity state for the dashboard: the subagent stream is silent
+	// while the model generates (and while it compacts), so the UI needs
+	// explicit transition events to avoid looking stuck.
+	let thinking = false;
+	const setThinking = (value: boolean) => {
+		if (thinking === value) return;
+		thinking = value;
+		opts.onEvent?.({ type: "node-thinking", nodeId: node.id, thinking: value });
+	};
+
 	const run = await runPiSubagent({
 		cwd: opts.cwd,
 		signal: opts.signal,
@@ -591,10 +642,22 @@ async function runNodeSubagent(
 		spawnImpl: opts.spawnImpl,
 		env: { DAG_NODE_ID: node.id },
 		onToolCall: (toolName, argsObj) => {
-			if (result.snippets.length < MAX_SNIPPETS) {
-				result.snippets.push({ toolName, args: argsObj });
-				opts.onEvent?.({ type: "snippet", nodeId: node.id, snippet: { toolName, args: argsObj } });
-			}
+			const snippet = { toolName, args: argsObj };
+			result.toolCalls = (result.toolCalls ?? 0) + 1;
+			// Always emit the live event (the dashboard tracks the latest
+			// command), but cap only what is RETAINED in the result — it is
+			// persisted in the transcript card, plan file, and run-state
+			// sidecar, so a marathon node keeps the most recent
+			// MAX_SNIPPETS (a ring buffer; `toolCalls` holds the true total).
+			result.snippets.push(snippet);
+			if (result.snippets.length > MAX_SNIPPETS) result.snippets.shift();
+			setThinking(false);
+			opts.onEvent?.({ type: "snippet", nodeId: node.id, snippet });
+		},
+		onMessageStart: () => setThinking(true),
+		onCompaction: (phase, { reason }) => {
+			if (phase === "start") result.compactions = (result.compactions ?? 0) + 1;
+			opts.onEvent?.({ type: "node-compaction", nodeId: node.id, phase, reason });
 		},
 	});
 

@@ -4,13 +4,18 @@
  * JSON schema (src/schema.ts) plus the acyclicity rule. `extractPlanJson`
  * is pure and unit-testable.
  *
- * Flavors (config "plannerExplore"):
- * - exploring (default): read-only repo tools plus the explore tool
- *   (src/explore-tool.ts, loaded via -e), so the planner can inspect the
- *   repository through a separate read-only researcher subagent — whose file
- *   reads never enter the planner's own context — before emitting the plan
- *   JSON.
- * - blind (faster): a single tool-less LLM completion.
+ * Flavors:
+ * - exploring (default, config "plannerExplore"): read-only repo tools plus
+ *   the explore tool (src/explore-tool.ts, loaded via -e), so the planner can
+ *   inspect the repository through a separate read-only researcher subagent —
+ *   whose file reads never enter the planner's own context — before emitting
+ *   the plan JSON.
+ * - blind (faster, plannerExplore: false): a single tool-less LLM completion.
+ * - refining (the refine loop): always a single tool-less completion, even
+ *   when the initial plan explored. The current plan already encodes the
+ *   repository knowledge the exploration produced (paths, commands, touches),
+ *   so revising it needs no re-exploration — one fast call that edits the
+ *   written plan instead of re-deriving it.
  *
  * Both pin the planner model and thinking level via CLI flags: config
  * "plannerModel"/"plannerThinking" when set (host resolves them), else the
@@ -90,6 +95,45 @@ Rules:
 - No git mutations (commits, pushes, branches) or destructive operations unless the user's request explicitly requires them; if a commit is required, make it a single final step after all edits.
 - "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
 - A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan — how to plan (conventions, step size, definitions of done), never what to plan: proposals or backlog items in it are not work to add unless the task itself asks for them.`;
+}
+
+/**
+ * System prompt for refining an existing plan (the refine loop, always
+ * blind): the user's message carries the current plan JSON plus feedback,
+ * and the model returns the complete revised plan — changed steps updated,
+ * unchanged steps copied verbatim. Kept separate from blindPlannerPrompt
+ * because it is tuned for editing (preserve ids and untouched steps) rather
+ * than decomposing from scratch.
+ */
+export function refinePlannerPrompt(maxSteps: number): string {
+	return `You are a DAG planner revising a plan the user already has. The user's message contains the plan to revise and feedback. The plan decomposes the user's task into steps that isolated coding subagents will execute in parallel; it was already drafted and reviewed, so treat it as the starting point — change only what the feedback requires, and keep everything else intact.
+
+Respond with ONLY a JSON object — no prose, no markdown fences — the complete revised plan, matching exactly:
+{
+  "goal": "One-sentence restatement of the user's goal",
+  "steps": [
+    {
+      "id": "s1",
+      "title": "Short human label for this step",
+      "prompt": "Self-contained task instructions for the subagent executing this step…",
+      "dependsOn": [],
+      "touches": ["src/example.ts"],
+      "tools": ["read", "grep", "find", "ls"]
+    }
+  ]
+}
+
+Rules:
+- Include EVERY step in your output — changed and unchanged. Copy unchanged steps verbatim from the current plan (same id, title, prompt, dependsOn, touches, tools); do not reword, re-derive, or drop them.
+- Preserve step ids wherever the feedback does not rename them — other steps' dependsOn reference them. If you remove or rename a step, update every dependsOn that pointed at it so no step references a missing id, and never create a cycle.
+- New and reworked steps keep the original size contract: one unit of work per step (usually ONE new file, or one tightly-coupled file plus its tests, and at most one feature), a self-contained prompt (subagents share NO conversation context — state the task, the exact file paths and commands, and the expected artifacts, ending with "Report: …"), under ~150 words, ending with the exact command that verifies the step. Keep the total at most ~${maxSteps} steps.
+- "dependsOn" lists ids of prerequisite steps. [] means the step can start immediately. Maximize parallelism: only add an edge where a step genuinely needs another step's output, or where two steps touch the same file or resource.
+- "touches" (required for steps that modify anything): the exact file paths the step creates or modifies, plus shared resources its commands mutate (lockfiles, build dirs, ports); read-only steps use []. Overlapping touches are serialized at run time — keep them disjoint or order the steps with dependsOn.
+- "tools" is optional. Include it only to restrict a step to a small tool set (e.g. ["read","grep","find","ls"] for research steps, ["read","edit","write","bash"] for implementation steps). Omit it to give the subagent the default tool set.
+- Keep complete coverage: the revised plan must still satisfy the user's original request as a whole. Do not silently drop requirements the feedback does not mention, and do not keep requirements the feedback explicitly retracts.
+- The last step(s) should verify the work (run tests, build, or report findings).
+- No-op: if the feedback implies the request requires no changes, respond with an empty steps array ({"goal": "…", "steps": []}) — that plan is valid and complete; never invent steps to fill it.
+- A project's PLAN.md may arrive in the user message under 'Project planning instructions'; treat it as authoritative project guidance for this plan — how to plan, never what to plan: proposals or backlog items in it are not work to add unless the task itself asks for them.`;
 }
 
 /** Fallback prompt for the blind single-call planner (no tools). */
@@ -214,6 +258,20 @@ export function buildBlindPlannerArgs(modelLabel: string, thinkingLevel?: string
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
 	args.push("--no-extensions", "--no-skills", "--no-context-files", "--no-tools");
 	args.push("--system-prompt", blindPlannerPrompt(getMaxSteps(config)));
+	return args;
+}
+
+/**
+ * pi CLI flags for the refine subagent: identical lockdown to the blind
+ * planner (single tool-less completion) with the refine system prompt —
+ * refining never re-explores the repo, because the current plan already
+ * carries the repository knowledge the exploration produced.
+ */
+export function buildRefinePlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
+	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
+	if (thinkingLevel) args.push("--thinking", thinkingLevel);
+	args.push("--no-extensions", "--no-skills", "--no-context-files", "--no-tools");
+	args.push("--system-prompt", refinePlannerPrompt(getMaxSteps(config)));
 	return args;
 }
 
@@ -351,6 +409,15 @@ function capPriorOutput(text: string): string {
 export const PLANNER_MAX_ATTEMPTS = 2;
 
 export interface PlanOptions {
+	/**
+	 * Refine, not a fresh plan: `priorPlanJson` is the current, accepted
+	 * plan being revised (not a failed attempt). The call is always a single
+	 * tool-less completion — refining never re-explores the repo, because the
+	 * current plan already encodes the repository knowledge the exploration
+	 * produced (paths, commands, touches). This keeps the refine loop fast:
+	 * one completion to edit the written plan, then an in-place redisplay.
+	 */
+	refine?: boolean;
 	/** User feedback (refine) or prior validation error (retry). */
 	feedback?: string;
 	/** The prior plan JSON (refine) or the failed raw output (retry). */
@@ -375,17 +442,20 @@ export interface PlanOptions {
 }
 
 /**
- * Produce a plan. The planner always runs as a pi subagent: by default it
- * explores the repo read-only before planning (config plannerExplore: false
- * = a single tool-less blind completion), and the plan JSON is extracted
- * from its final message. Model/thinking: config "plannerModel"/
- * "plannerThinking" when set (opts.modelLabel / opts.thinkingLevel), else
- * the session's current model and thinking level. When the project root
- * (ctx.cwd) has a PLAN.md, its contents are injected into the user text as
- * planner-only project planning instructions (loadPlannerInstructions) —
- * the executing subagents never see it. Returns null when aborted (Esc),
- * throws a PlanError with a diagnostic otherwise (the raw output that
- * failed to parse/validate is attached when available).
+ * Produce (or refine) a plan. The planner always runs as a pi subagent:
+ * by default it explores the repo read-only before planning (config
+ * plannerExplore: false = a single tool-less blind completion), and the
+ * plan JSON is extracted from its final message. Refine (opts.refine)
+ * instead runs a single tool-less completion that edits the current plan
+ * (opts.priorPlanJson) per the feedback — no re-exploration. Model/
+ * thinking: config "plannerModel"/"plannerThinking" when set
+ * (opts.modelLabel / opts.thinkingLevel), else the session's current model
+ * and thinking level. When the project root (ctx.cwd) has a PLAN.md, its
+ * contents are injected into the user text as planner-only project planning
+ * instructions (loadPlannerInstructions) — the executing subagents never
+ * see it. Returns null when aborted (Esc), throws a PlanError with a
+ * diagnostic otherwise (the raw output that failed to parse/validate is
+ * attached when available).
  */
 export async function plan(
 	ctx: ExtensionCommandContext,
@@ -396,7 +466,11 @@ export async function plan(
 	const model = ctx.model;
 	if (!model) throw new Error("no model selected (use /model)");
 	const cfg = opts.config ?? DEFAULT_CONFIG;
-	const exploring = plannerExplores(cfg);
+	// Refine is always blind: re-exploring the repo for an edit of an already
+	// written plan would redo the most expensive part of planning for no gain
+	// (the plan's prompts, paths, and commands already carry what the
+	// exploration found). The initial plan still honors plannerExplore.
+	const exploring = plannerExplores(cfg) && !opts.refine;
 	const modelLabel = opts.modelLabel ?? `${model.provider}/${model.id}`;
 	const thinkingLevel = opts.thinkingLevel ?? ctx.thinkingLevel;
 
@@ -407,22 +481,41 @@ export async function plan(
 			`Project planning instructions (from PLAN.md):\n${planMd}\nThese are planning-only instructions: follow them when shaping the plan; they are not visible to the executing subagents. They guide HOW to plan (conventions, step size, definitions of done) — never what to plan: a proposal, idea, or backlog item in PLAN.md is not work to add to the plan unless the task itself asks for it.`,
 		);
 	parts.push(`Plan this task:\n\n${prompt}`);
-	if (opts.priorPlanJson)
-		parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
-	if (opts.feedback) {
-		const hint = retryHintFor(opts.feedback);
-		parts.push(
-			`Address this feedback / error from the previous attempt:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond again with ONLY the revised JSON plan.`,
-		);
+	if (opts.refine) {
+		// The plan to revise: the current plan on the first refine attempt, or
+		// a failed attempt's raw output on a retry within the refine. Included
+		// in full — no tail cap (capPriorOutput): the model must see the whole
+		// plan it is editing, and a plan is bounded by maxSteps, not unbounded.
+		if (opts.priorPlanJson)
+			parts.push(
+				`The plan to revise (the current plan, or a failed attempt's output that may be invalid or truncated):\n\n${opts.priorPlanJson}`,
+			);
+		if (opts.feedback) {
+			const hint = retryHintFor(opts.feedback);
+			parts.push(
+				`Apply this feedback to the plan, changing only what it requires:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond with ONLY the complete revised JSON plan — include every step, changed or unchanged.`,
+			);
+		}
+	} else {
+		if (opts.priorPlanJson)
+			parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
+		if (opts.feedback) {
+			const hint = retryHintFor(opts.feedback);
+			parts.push(
+				`Address this feedback / error from the previous attempt:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond again with ONLY the revised JSON plan.`,
+			);
+		}
 	}
 	const userText = parts.join("\n\n");
 
 	return runPlannerSubagent({
 		cwd: ctx.cwd,
 		signal,
-		args: exploring
-			? buildPlannerArgs(modelLabel, thinkingLevel, cfg)
-			: buildBlindPlannerArgs(modelLabel, thinkingLevel, cfg),
+		args: opts.refine
+			? buildRefinePlannerArgs(modelLabel, thinkingLevel, cfg)
+			: exploring
+				? buildPlannerArgs(modelLabel, thinkingLevel, cfg)
+				: buildBlindPlannerArgs(modelLabel, thinkingLevel, cfg),
 		userText,
 		cfg,
 		spawnImpl: opts.spawnImpl,

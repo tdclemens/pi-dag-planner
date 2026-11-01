@@ -430,8 +430,9 @@ export interface PiSubagentOptions {
 	 * subagent's context grew past the model's compaction threshold (or a
 	 * model call overflowed), so pi runs a summarization LLM call before the
 	 * next request — emitting no tool calls and no messages. Without this
-	 * hook the UI would look stuck (or, worse, keep showing the last command
-	 * line as if it were still running).
+	 * hook the UI would look stuck for the whole window; with it the
+	 * dashboard marks the last command line "compacting…" so it cannot pass
+	 * for a command that is still running.
 	 * `reason` is "threshold" or "overflow" when known; `error` is set on the
 	 * end phase when the compaction itself failed.
 	 */

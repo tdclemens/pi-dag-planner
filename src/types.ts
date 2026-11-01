@@ -143,8 +143,9 @@ export type DagEvent =
 	| { type: "node-compaction"; nodeId: string; phase: "start" | "end"; reason?: string }
 	/**
 	 * The node's model is generating a response (true) or a tool call has
-	 * started again (false). Lets the dashboard show "thinking…" instead of
-	 * a stale command line while the model thinks between tool calls.
+	 * started again (false). Lets the dashboard mark its last command line
+	 * "thinking…" while the model generates between tool calls — the previous
+	 * tool call always stays visible; the marker shows it is not running.
 	 */
 	| { type: "node-thinking"; nodeId: string; thinking: boolean }
 	/**

@@ -627,16 +627,27 @@ export class RunDashboard implements Component {
 					const retry = row.retry
 						? t.fg("warning", ` (retry ${row.retry.attempt}/${row.retry.maxAttempts}: ${truncate(row.retry.reason, 48)})`)
 						: "";
-					// What the node is doing right now, most specific first: a
-					// compaction hides the last command line (the subagent is in a
-					// summarization call, not running that command), and thinking
-					// beats a stale snippet (the model is generating).
-					const activity = row.compacting
-						? t.fg("warning", "compacting context…") + (row.compacting.reason ? t.fg("muted", ` (${row.compacting.reason})`) : "")
+					// The previous tool call always anchors the row: the thinking
+					// and compaction windows dominate wall-clock time (the model
+					// generates far longer than tools run), so letting them replace
+					// the command line made most of the run read as a bare, generic
+					// "thinking…". The model state rides along as a trailing marker
+					// instead — it also shows the displayed command has finished
+					// (not still running), and it degrades gracefully under line
+					// truncation (the command survives, the marker is what gets
+					// cut). The state stands alone only before the node's first
+					// tool call, when there is no command to show.
+					const marker = row.compacting
+						? t.fg("warning", " · compacting…") + (row.compacting.reason ? t.fg("muted", ` (${row.compacting.reason})`) : "")
 						: row.thinking
-							? t.fg("dim", "thinking…")
-							: row.snippet
-								? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t))
+							? t.fg("dim", " · thinking…")
+							: "";
+					const activity = row.snippet
+						? t.fg("muted", "→ ") + formatSnippet(row.snippet.toolName, row.snippet.args, t.fg.bind(t)) + marker
+						: row.compacting
+							? t.fg("warning", "compacting context…") + (row.compacting.reason ? t.fg("muted", ` (${row.compacting.reason})`) : "")
+							: row.thinking
+								? t.fg("dim", "thinking…")
 								: t.fg("dim", "…");
 					line = `${glyph} ${id}  ${node.title}${retry}  ${activity}`;
 					break;

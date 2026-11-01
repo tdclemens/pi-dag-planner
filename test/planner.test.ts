@@ -9,6 +9,7 @@ import {
 	buildBlindPlannerArgs,
 	buildPlannerArgs,
 	blindPlannerPrompt,
+	buildRefinePlannerArgs,
 	extractPlanJson,
 	loadPlannerInstructions,
 	normalizePlan,
@@ -17,6 +18,7 @@ import {
 	plan,
 	planWithRetries,
 	plannerSystemPrompt,
+	refinePlannerPrompt,
 	PLANNER_MAX_ATTEMPTS,
 	MAX_PLAN_MD_CHARS,
 	PLANNER_INSTRUCTIONS_FILE,
@@ -452,6 +454,126 @@ test("plan() blind path pins a configured planner model and thinking level too",
 	});
 	assert.equal(capturedArgs![capturedArgs!.indexOf("--model") + 1], "google/gemini-x");
 	assert.equal(capturedArgs![capturedArgs!.indexOf("--thinking") + 1], "off");
+});
+
+// ---------------------------------------------------------------------------
+// Refine: a single blind edit of the current plan (never re-explores)
+// ---------------------------------------------------------------------------
+
+test("buildRefinePlannerArgs pins a tool-less refine subagent with the refine prompt", () => {
+	assert.deepEqual(buildRefinePlannerArgs("anthropic/claude-x", "medium", { ...DEFAULT_CONFIG, maxSteps: 12 }), [
+		"--mode", "json", "-p", "--no-session",
+		"--model", "anthropic/claude-x",
+		"--thinking", "medium",
+		"--no-extensions", "--no-skills", "--no-context-files", "--no-tools",
+		"--system-prompt", refinePlannerPrompt(12),
+	]);
+});
+
+test("buildRefinePlannerArgs omits --thinking when undefined and interpolates the soft cap", () => {
+	const args = buildRefinePlannerArgs("p/m");
+	assert.ok(!args.includes("--thinking"));
+	assert.equal(args[args.indexOf("--system-prompt") + 1], refinePlannerPrompt(DEFAULT_MAX_STEPS));
+	const custom = buildRefinePlannerArgs("p/m", undefined, { ...DEFAULT_CONFIG, maxSteps: 25 });
+	assert.equal(custom[custom.indexOf("--system-prompt") + 1], refinePlannerPrompt(25));
+});
+
+test("refine prompt: edit in place, verbatim copies, stable ids, same output contract", () => {
+	const p = refinePlannerPrompt(12);
+	assert.match(p, /revising a plan the user already has/i);
+	assert.match(p, /change only what the feedback requires/i, "minimal-edit guidance");
+	assert.match(p, /ONLY a JSON object/i);
+	assert.match(p, /the complete revised plan/i);
+	assert.match(p, /Copy unchanged steps verbatim/i, "unchanged steps are copied, not re-derived");
+	assert.match(p, /Preserve step ids/i, "ids are stable: dependents reference them");
+	assert.match(p, /remove or rename a step, update every dependsOn/i, "removals re-wire dependencies");
+	assert.match(p, /~12 steps/i, "soft cap interpolated");
+	assert.match(p, /\"steps": \[\]/, "no-op still the correct answer when the feedback retracts the work");
+	assert.match(p, /never invent steps/i);
+	assert.match(p, /serialized at run time/i);
+	assert.match(p, /never what to plan/i, "PLAN.md stays how-to, not what-to");
+});
+
+test("plan() refine runs a single blind completion even when exploration is configured", async () => {
+	let capturedArgs: string[] | undefined;
+	const result = await plan(fakeCtx(), "Add tests", {
+		refine: true,
+		priorPlanJson: validPlanJson,
+		feedback: "split the survey step",
+		// Exploring is the default config, but refine must still be blind.
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(result);
+	assert.ok(capturedArgs);
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1], refinePlannerPrompt(DEFAULT_MAX_STEPS));
+	assert.ok(capturedArgs!.includes("--no-tools"), "refine has no tools");
+	assert.ok(!capturedArgs!.includes("--tools"), "no read-only tool allow-list either");
+	assert.ok(!capturedArgs!.includes(EXPLORE_TOOL_PATH), "no explore tool");
+});
+
+test("plan() refine includes the current plan in full (no tail cap) framed as the plan to revise", async () => {
+	// A large current plan (well past MAX_PRIOR_OUTPUT_CHARS): a failed
+	// truncation retry gets tail-capped, but a refine must see every step.
+	const bigPrompt = "Do the thing. ".repeat(1500); // ~21KB inside one step
+	const currentPlan = JSON.stringify({
+		goal: "Big goal",
+		steps: [
+			{ id: "head", title: "Head", prompt: "HEAD-MARKER keep me", dependsOn: [] },
+			{ id: "big", title: "Big", prompt: bigPrompt, dependsOn: ["head"] },
+		],
+	}, null, 2);
+	assert.ok(currentPlan.length > 20000, `plan must exceed the retry cap (${currentPlan.length} chars)`);
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "Add tests", {
+		refine: true,
+		priorPlanJson: currentPlan,
+		feedback: "shrink the big step",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(capturedText!.includes("HEAD-MARKER keep me"), "head of the plan is NOT elided");
+	assert.ok(!capturedText!.includes("earlier output elided"), "no elision marker for a refine");
+	assert.match(capturedText!, /The plan to revise/);
+	assert.ok(capturedText!.includes(bigPrompt), "full step prompt present");
+});
+
+test("plan() refine frames the feedback as an edit request and asks for the complete plan", async () => {
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "Add tests", {
+		refine: true,
+		priorPlanJson: validPlanJson,
+		feedback: "split s2 into smaller steps",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(capturedText!.includes("split s2 into smaller steps"), "the feedback is present");
+	assert.match(capturedText!, /Apply this feedback to the plan, changing only what it requires/);
+	assert.match(capturedText!, /the complete revised JSON plan — include every step/);
+	// Not the retry framing (a failed attempt), which is for fresh plans only:
+	assert.ok(!capturedText!.includes("Address this feedback / error from the previous attempt"));
+});
+
+test("plan() refine never surfaces tool activity (there are no tools)", async () => {
+	const snippets: string[] = [];
+	await plan(fakeCtx(), "Add tests", {
+		refine: true,
+		priorPlanJson: validPlanJson,
+		feedback: "x",
+		onExplore: (s) => snippets.push(s),
+		spawnImpl: () =>
+			fakeProc([
+				{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
+				{ type: "message_end", message: assistantMessage(validPlanJson) },
+			]),
+	});
+	assert.deepEqual(snippets, [], "blind refine wires no tool/message/compaction callbacks");
 });
 
 // ---------------------------------------------------------------------------

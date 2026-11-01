@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,6 +9,7 @@ import {
 	extractPromptFromMarkdown,
 	loadRunState,
 	renderPlanMarkdown,
+	revisePlan,
 	runStatePath,
 	saveRunState,
 	setPlanFileStatus,
@@ -38,6 +40,68 @@ test("renderPlanMarkdown omits the duration line when unknown", () => {
 	const md = renderPlanMarkdown(plan, "the prompt", "pending");
 	assert.ok(!md.includes("**Planned in:**"), md);
 	assert.ok(md.includes("- **Status:** pending"), md);
+});
+
+test("renderPlanMarkdown adds a Revised line (after Created, before Planned in) only when provided", () => {
+	const md = renderPlanMarkdown(plan, "the prompt", "pending", 12000, "2025-01-01T12:00:00.000Z");
+	assert.ok(md.includes("- **Revised:** 2025-01-01T12:00:00.000Z"), md);
+	const createdIdx = md.indexOf("- **Created:**");
+	const revisedIdx = md.indexOf("- **Revised:**");
+	const plannedIdx = md.indexOf("- **Planned in:**");
+	const statusIdx = md.indexOf("- **Status:**");
+	assert.ok(createdIdx < revisedIdx && revisedIdx < plannedIdx && plannedIdx < statusIdx, md);
+	const fresh = renderPlanMarkdown(plan, "the prompt", "pending", 12000);
+	assert.ok(!fresh.includes("**Revised:**"), "no Revised line without a revision");
+});
+
+test("revisePlan rewrites the same file: new plan + pending status, original Created kept, Revised added", async () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "dag-planner-revise-"));
+	try {
+		const file = path.join(dir, "20250101-120000-test-goal.md");
+		const before = renderPlanMarkdown(plan, "the prompt", "pending");
+		await fsp.writeFile(file, before, "utf8");
+		const createdLine = before.match(/^(- \*\*Created:\*\* .*)$/m)?.[1];
+		assert.ok(createdLine);
+
+		const revised: DagPlan = {
+			goal: "Test goal",
+			steps: [
+				{ id: "s1", title: "First", prompt: "do first (v2)", dependsOn: [] },
+				{ id: "s2", title: "Second", prompt: "do second", dependsOn: ["s1"] },
+				{ id: "s3", title: "Third", prompt: "do third", dependsOn: ["s2"] },
+			],
+		};
+		const returned = await revisePlan(file, revised, "the prompt", 5000);
+		assert.equal(returned, file, "the path is unchanged — no new -2.md file");
+
+		const after = await fsp.readFile(file, "utf8");
+		assert.ok(after.includes(createdLine!), "original Created timestamp preserved");
+		assert.match(after, /^- \*\*Revised:\*\* /m, "Revised line added");
+		assert.ok(after.includes("- **Status:** pending"), "status back to pending");
+		assert.ok(after.includes("do first (v2)"), "revised step content");
+		assert.ok(after.includes('"s3"'), "new step embedded in the JSON");
+		assert.ok(after.includes("3. **s3** — Third — deps: s2"), "steps list re-rendered");
+		const json = extractPlanFromMarkdown(after)!;
+		assert.equal(json!.steps.length, 3);
+		// Exactly one file in the directory — no litter per refine round.
+		assert.deepEqual(await fsp.readdir(dir), ["20250101-120000-test-goal.md"]);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("revisePlan recreates the file when it was deleted out from under the plan", async () => {
+	const dir = mkdtempSync(path.join(os.tmpdir(), "dag-planner-revise-"));
+	try {
+		const file = path.join(dir, "gone.md");
+		const returned = await revisePlan(file, plan, "the prompt");
+		assert.equal(returned, file);
+		const md = await fsp.readFile(file, "utf8");
+		assert.ok(md.includes("- **Status:** pending"), md);
+		assert.match(md, /^- \*\*Revised:\*\* /m);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("renderPlanMarkdown lists touches on step lines only when declared", () => {

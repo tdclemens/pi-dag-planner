@@ -51,7 +51,13 @@ export function planFileName(goal: string, d: Date = new Date(), dir: string = P
 export type PlanFileStatus = "pending" | "executing" | "completed" | "completed-with-failures" | "aborted";
 
 /** Render the full plan markdown (header, steps list, embedded JSON). */
-export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: PlanFileStatus, planDurationMs?: number): string {
+export function renderPlanMarkdown(
+	plan: DagPlan,
+	rawPrompt: string,
+	status: PlanFileStatus,
+	planDurationMs?: number,
+	revisedAt?: string,
+): string {
 	let waveDesc: string;
 	try {
 		waveDesc = topologicalLevels(plan.steps)
@@ -63,6 +69,7 @@ export function renderPlanMarkdown(plan: DagPlan, rawPrompt: string, status: Pla
 	const lines: string[] = [];
 	lines.push(`# DAG Plan: ${plan.goal}`, "");
 	lines.push(`- **Created:** ${new Date().toISOString()}`);
+	if (revisedAt) lines.push(`- **Revised:** ${revisedAt}`);
 	if (planDurationMs !== undefined) lines.push(`- **Planned in:** ${formatDuration(planDurationMs)}`);
 	lines.push(`- **Status:** ${status}`);
 	lines.push(`- **Prompt:** ${rawPrompt}`);
@@ -83,6 +90,35 @@ export async function savePlan(plan: DagPlan, rawPrompt: string, planDurationMs?
 		const file = path.join(PLANS_DIR, planFileName(plan.goal));
 		await fs.promises.writeFile(file, renderPlanMarkdown(plan, rawPrompt, "pending", planDurationMs), "utf8");
 		return file;
+	});
+}
+
+/**
+ * Revise a saved plan file in place (the refine loop): rewrite the same file
+ * with the revised plan (status back to "pending", fresh embedded JSON and
+ * steps list) instead of minting a new timestamped file per round. The
+ * original "Created" timestamp is preserved; a "Revised" line records when
+ * the plan was last changed. Returns the (unchanged) path.
+ */
+export async function revisePlan(
+	planPath: string,
+	plan: DagPlan,
+	rawPrompt: string,
+	planDurationMs?: number,
+): Promise<string> {
+	return enqueue(async () => {
+		await fs.promises.mkdir(path.dirname(planPath), { recursive: true });
+		let created: string | undefined;
+		try {
+			const m = (await fs.promises.readFile(planPath, "utf8")).match(/^(- \*\*Created:\*\* )(.*)$/m);
+			created = m?.[2]?.trim() || undefined;
+		} catch {
+			/* file missing — recreate it below */
+		}
+		let md = renderPlanMarkdown(plan, rawPrompt, "pending", planDurationMs, new Date().toISOString());
+		if (created) md = md.replace(/^(- \*\*Created:\*\* ).*$/m, `$1${created}`);
+		await fs.promises.writeFile(planPath, md, "utf8");
+		return planPath;
 	});
 }
 

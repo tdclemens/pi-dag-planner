@@ -186,36 +186,64 @@ test("running row shows latest command snippet", () => {
 	assert.ok(!row.includes("ls src/"), "only the latest snippet should be shown");
 });
 
-test("running row shows the compaction window, then reverts to the latest snippet", () => {
+test("running row keeps the latest snippet through the compaction window, marked as compacting", () => {
 	const { dashboard, emit } = makeDashboard();
 	emit({ type: "node-start", nodeId: "a" });
 	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "bash", args: { command: "npm test" } } });
 	emit({ type: "node-compaction", nodeId: "a", phase: "start", reason: "threshold" });
 	let row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
-	assert.ok(row.includes("compacting context…"), row);
+	assert.ok(row.includes("compacting"), row);
 	assert.ok(row.includes("threshold"), row);
-	assert.ok(!row.includes("npm test"), "a stale command must not imply that command is still running");
+	assert.ok(row.includes("npm test"), "the previous tool call always stays visible");
 
 	emit({ type: "node-compaction", nodeId: "a", phase: "end" });
 	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
 	assert.ok(row.includes("npm test"), row);
 	assert.ok(!row.includes("compacting"), row);
+	assert.ok(!row.includes(" · "), "no state marker once the window ends");
 });
 
-test("running row shows thinking while the model generates, and reverts on a tool call", () => {
+test("a node that compacts before its first tool call shows the state alone", () => {
+	const dashboard = new RunDashboard(
+		{ goal: "g", steps: [{ id: "s", title: "Solo", prompt: "p", dependsOn: [] }] },
+		theme,
+		() => {},
+		() => {},
+	);
+	dashboard.update({ type: "node-start", nodeId: "s" });
+	dashboard.update({ type: "node-compaction", nodeId: "s", phase: "start", reason: "overflow" });
+	const row = dashboard.render(W).find((l) => l.includes("Solo"))!;
+	assert.ok(row.includes("compacting context…"), row);
+	assert.ok(row.includes("overflow"), row);
+	assert.ok(!row.includes("·"), row);
+});
+
+test("running row keeps the previous tool call while the model generates, marked as thinking", () => {
 	const { dashboard, emit } = makeDashboard();
 	emit({ type: "node-start", nodeId: "a" });
 	let row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
 	assert.ok(!row.includes("thinking"), row);
 
+	// Before the first tool call there is no command to keep: the state
+	// stands alone.
 	emit({ type: "node-thinking", nodeId: "a", thinking: true });
 	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
 	assert.ok(row.includes("thinking…"), row);
 
-	emit({ type: "node-thinking", nodeId: "a", thinking: false });
+	// A tool call arrives, then the next turn begins: the previous call
+	// stays visible, marked as thinking (the model is generating, not
+	// running it).
 	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "bash", args: { command: "npm test" } } });
+	emit({ type: "node-thinking", nodeId: "a", thinking: true });
 	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
 	assert.ok(row.includes("npm test"), row);
+	assert.ok(row.includes("thinking…"), row);
+
+	// A new tool call clears the marker: that call is the one running.
+	emit({ type: "node-thinking", nodeId: "a", thinking: false });
+	emit({ type: "snippet", nodeId: "a", snippet: { toolName: "bash", args: { command: "npm install" } } });
+	row = dashboard.render(W).find((l) => l.includes("Alpha"))!;
+	assert.ok(row.includes("npm install"), row);
 	assert.ok(!row.includes("thinking"), row);
 
 	assert.ok(dashboard.render(W)[0].includes("1 running"), dashboard.render(W)[0]);

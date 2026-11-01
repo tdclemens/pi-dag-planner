@@ -227,11 +227,16 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	/**
 	 * Phases 1+2 (shared by /dag-plan and /dag-compile): draft the plan with
 	 * bounded retries behind a cancellable loader, then run the accept gate
-	 * (Execute / Refine ≤3 / Reject). Returns the accepted gate's result
-	 * (presentPlan's shape), or null when planning fails, the user
-	 * cancels/rejects, the session aborts, or the plan is a no-op (empty
-	 * steps — nothing to do; already notified). Failures are already
-	 * notified.
+	 * (Execute / Refine ≤3 / Reject). Refines are fast by design: the plan is
+	 * already written, so each round is one blind completion that edits it
+	 * (no re-exploration), the same plan file is revised in place (stable
+	 * path), and the revised plan is re-presented as "rev N". Returns the
+	 * accepted gate's result (presentPlan's shape) with planDurationMs /
+	 * plannerUsage accumulated over the WHOLE planning phase (initial plan +
+	 * every refine round — what the user actually waited for), or null when
+	 * planning fails, the user cancels/rejects, the session aborts, or the
+	 * plan is a no-op (empty steps — nothing to do; already notified).
+	 * Failures are already notified.
 	 */
 	async function planGateAndExecute(
 		ctx: ExtensionCommandContext,
@@ -277,11 +282,16 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		// ------------------------------------------------------------------
 		let refineAttempts = 0;
 		let gate = current;
+		// Total planning effort (wall-clock + tokens) across all phases, so
+		// the post-run summary reports the whole journey to an accepted plan,
+		// not just the last LLM call.
+		let planMs = planDurationMs;
+		let plannerUsage = planOutcome.result.usage;
 		while (true) {
 			if (signal.aborted) return null;
 			const options = ["Execute plan"];
 			if (refineAttempts < MAX_REFINE_ATTEMPTS) {
-				options.push(`Refine (${refineAttempts}/${MAX_REFINE_ATTEMPTS}) — re-plan with feedback`);
+				options.push(`Refine (${refineAttempts}/${MAX_REFINE_ATTEMPTS}) — revise the plan with feedback`);
 			}
 			options.push("Reject plan");
 			const choice = await ctx.ui.select("DAG plan — what next?", options);
@@ -295,26 +305,45 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			if (fb === undefined || signal.aborted) return null;
 			refineAttempts++;
 
+			// Refine = edit the written plan: one tool-less completion (never
+			// re-explores the repo), then the in-place redisplay below.
 			const rePlanStartedAt = Date.now();
-			const reOutcome = await planWithRetries((f, prior) => planOnce(ctx, prompt, models.planner, config, f, prior), {
-				initialFeedback: fb.trim() || undefined,
-				initialPriorJson: gate.rawJson,
-				isAborted: () => signal.aborted,
-			});
+			const reOutcome = await planWithRetries(
+				(f, prior) => planOnce(ctx, prompt, models.planner, config, f, prior, true),
+				{
+					initialFeedback: fb.trim() || undefined,
+					initialPriorJson: gate.rawJson,
+					isAborted: () => signal.aborted,
+				},
+			);
 			if (!reOutcome.ok) {
 				if (!reOutcome.aborted) ctx.ui.notify(`Re-planning failed: ${reOutcome.error}`, "error");
 				return null;
 			}
 			if (isNoOpPlan(reOutcome.result.plan)) {
-				ctx.ui.notify(`No-op plan — ${reOutcome.result.plan.goal} Nothing to do; no plan file saved.`, "info");
+				// A refine that retracts all the work: the saved plan file keeps
+				// the last non-no-op version (it was already written).
+				ctx.ui.notify(
+					`Refine produced a no-op plan — ${reOutcome.result.plan.goal} The plan at ${shortenHome(gate.planPath)} is unchanged; reject it to discard the whole thing.`,
+					"info",
+				);
 				return null;
 			}
-			const revised = await presentPlan(ctx, reOutcome.result, prompt, Date.now() - rePlanStartedAt);
+			planMs += Date.now() - rePlanStartedAt;
+			plannerUsage = addUsage(plannerUsage, reOutcome.result.usage);
+			const revised = await presentPlan(
+				ctx,
+				reOutcome.result,
+				prompt,
+				Date.now() - rePlanStartedAt,
+				gate.planPath,
+				refineAttempts + 1,
+			);
 			if (!revised) return null;
 			gate = revised;
 		}
 
-		return gate;
+		return { ...gate, planDurationMs: planMs, plannerUsage };
 	}
 
 	/**
@@ -763,6 +792,8 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 	 * One planner LLM call behind a cancellable loader.
 	 * Returns null when aborted (Esc / session), the plan on success, or a
 	 * failure (with the raw output attached when the planner produced one).
+	 * `refine` marks a refine call: it edits the written plan in a single
+	 * tool-less completion (never re-explores) and the loader label says so.
 	 */
 	function planOnce(
 		ctx: ExtensionCommandContext,
@@ -771,11 +802,14 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		config: DagPlanConfig,
 		feedback: string | undefined,
 		priorJson: string | undefined,
+		refine = false,
 	): Promise<PlannerResult | PlanRetryFailure | null> {
 		return ctx.ui.custom<PlannerResult | PlanRetryFailure | null>((tui, theme, _kb, done) => {
-			const label = plannerExplores(config)
-				? `Planning with ${planner.model} (exploring repo)…`
-				: `Planning with ${planner.model}…`;
+			const label = refine
+				? `Refining plan with ${planner.model}…`
+				: plannerExplores(config)
+					? `Planning with ${planner.model} (exploring repo)…`
+					: `Planning with ${planner.model}…`;
 			const loader = new BorderedLoader(tui, theme, label, { cancellable: true });
 			// Planner tool activity renders inside the loader box (not the
 			// status bar): a line inserted right after the label, updated in
@@ -802,6 +836,7 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 					thinkingLevel: planner.thinking,
 					feedback,
 					priorPlanJson: priorJson,
+					refine,
 					onExplore: (snippet) => {
 						snippetLine.setText(theme.fg("muted", snippet));
 						tui.requestRender();
@@ -820,12 +855,19 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		});
 	}
 
-	/** Save the plan file and send the friendly plan message. */
+	/**
+	 * Save the plan file and send the friendly plan message.
+	 * `existingPlanPath` (refine) revises that file in place — same path,
+	 * Created timestamp preserved, no -2.md litter — and `revision` (>1)
+	 * marks the message as a revision of the presented plan.
+	 */
 	function presentPlan(
 		ctx: ExtensionCommandContext,
 		result: PlannerResult,
 		prompt: string,
 		planDurationMs: number,
+		existingPlanPath?: string,
+		revision?: number,
 	): Promise<{
 		plan: PlannerResult["plan"];
 		planPath: string;
@@ -836,7 +878,9 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 		return (async () => {
 			let planPath: string;
 			try {
-				planPath = await plans.savePlan(result.plan, prompt, planDurationMs);
+				planPath = existingPlanPath
+					? await plans.revisePlan(existingPlanPath, result.plan, prompt, planDurationMs)
+					: await plans.savePlan(result.plan, prompt, planDurationMs);
 			} catch (e) {
 				ctx.ui.notify(`Failed to save plan file: ${e instanceof Error ? e.message : String(e)}`, "error");
 				return null;
@@ -846,11 +890,18 @@ export default function dagPlanExtension(pi: ExtensionAPI): void {
 			// implied serialization) are shown with the plan for review.
 			const v = validatePlan(result.plan);
 			const warnings = v.ok ? v.warnings : undefined;
+			const rev = revision && revision > 1 ? ` (rev ${revision})` : "";
 			pi.sendMessage({
 				customType: PLAN_MESSAGE_TYPE,
-				content: `DAG Plan — ${result.plan.goal} (${result.plan.steps.length} steps)`,
+				content: `DAG Plan${rev} — ${result.plan.goal} (${result.plan.steps.length} steps)`,
 				display: true,
-				details: { plan: result.plan, planPath, planDurationMs, warnings },
+				details: {
+					plan: result.plan,
+					planPath,
+					planDurationMs,
+					warnings,
+					...(revision && revision > 1 ? { revision } : {}),
+				},
 			});
 			return { plan: result.plan, planPath, rawJson: result.rawJson, plannerUsage: result.usage, planDurationMs };
 		})();

@@ -597,6 +597,33 @@ test("renderPlanMessage shows validation warnings when the plan has them", () =>
 	assert.ok(!text2.includes("⚠"), text2);
 });
 
+test("renderPlanMessage marks a refined plan as a revision (title + in-place footer)", () => {
+	const msg = {
+		content: "DAG Plan (rev 2) — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md", planDurationMs: 8000, revision: 2 },
+	};
+	const comp = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme);
+	const text = comp.render(W).join("\n");
+	assert.ok(text.includes("DAG Plan (rev 2) — 2 steps"), text);
+	assert.ok(text.includes("Plan updated:"), "in-place revision, not a fresh save");
+	assert.ok(!text.includes("Plan saved:"), text);
+	// Revision 1 (the original draft) keeps the classic rendering.
+	const msg1 = { content: "DAG Plan — test goal (2 steps)", details: { plan, planPath: "/p/x.md", revision: 1 } };
+	const text1 = renderPlanMessage(msg1 as never, { expanded: false, outputPad: 0 }, theme).render(W).join("\n");
+	assert.ok(!text1.includes("(rev 1)"), text1);
+	assert.ok(text1.includes("Plan saved:"), text1);
+});
+
+test("renderPlanMessage omits the revision mark for older sessions (no revision in details)", () => {
+	const msg = {
+		content: "DAG Plan — test goal (2 steps)",
+		details: { plan, planPath: "/home/u/.agents/plans/x.md" },
+	};
+	const text = renderPlanMessage(msg as never, { expanded: false, outputPad: 0 }, theme).render(W).join("\n");
+	assert.ok(!text.includes("(rev"), text);
+	assert.ok(text.includes("Plan saved:"), text);
+});
+
 test("renderPlanMessage marks already-done steps and shows the resume footer", () => {
 	const msg = {
 		content: "DAG Plan (resume) — test goal (2 steps, 1 done)",

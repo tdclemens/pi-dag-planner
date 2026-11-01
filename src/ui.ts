@@ -208,6 +208,12 @@ export interface DagPlanDetails {
 	warnings?: string[];
 	/** Resume: ids of the steps already completed in a prior run. */
 	resume?: { done: string[] };
+	/**
+	 * Refine round this message represents (1 = the original draft; the first
+	 * refine is 2). >1 renders the title as "(rev N)" and the footer as
+	 * "Plan updated:" — the same plan file was revised in place.
+	 */
+	revision?: number;
 }
 
 export function renderPlanMessage(
@@ -228,7 +234,8 @@ export function renderPlanMessage(
 
 	const { plan, planPath } = details;
 	const lines: string[] = [];
-	lines.push(theme.fg("accent", theme.bold(`DAG Plan — ${plan.steps.length} steps`)));
+	const revision = details.revision && details.revision > 1 ? ` (rev ${details.revision})` : "";
+	lines.push(theme.fg("accent", theme.bold(`DAG Plan${revision} — ${plan.steps.length} steps`)));
 	lines.push(theme.fg("dim", plan.goal));
 
 	let waves: DagNode[][];
@@ -281,7 +288,8 @@ export function renderPlanMessage(
 			const remaining = plan.steps.length - done;
 			lines.push(theme.fg("dim", `Resuming: ${shortenHome(planPath)} — ${done} done, ${remaining} to run   (Ctrl+O: JSON)`));
 		} else {
-			lines.push(theme.fg("dim", `Plan saved: ${shortenHome(planPath)}   (Ctrl+O: JSON)`));
+			const label = revision ? "Plan updated:" : "Plan saved:";
+			lines.push(theme.fg("dim", `${label} ${shortenHome(planPath)}   (Ctrl+O: JSON)`));
 		}
 	}
 

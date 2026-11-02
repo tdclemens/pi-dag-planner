@@ -21,7 +21,7 @@ DAG Plan — 4 steps
   ● s3  Write tests for parser  (← s1, s2)
   ● s4  Run tests and fix failures  (← s3)
 
-? DAG plan — what next?  › Execute plan · Refine (0/3) — revise the plan · Reject
+? DAG plan — what next?  › Execute plan · Refine (0/3) — revise · Re-plan (0/3) — re-explore · Reject
 ```
 
 ## Features
@@ -31,7 +31,7 @@ DAG Plan — 4 steps
 - **Live feedback** — a runner panel shows per-node status, durations, and what each node is doing right now: the latest command, which always stays visible and is marked `· thinking…` while the model generates and `· compacting…` while the subagent compresses its own context (before a node's first command the state stands alone); each finished node appends a result card to the transcript and to the plan file.
 - **Safe concurrency** — three layers keep parallel nodes from corrupting shared files (see [How it works](#how-it-works)).
 - **Durable records** — plans save to `~/.agents/plans/` as markdown with the exact JSON and post-run results, revised in place on refine (one file per plan, `Created` preserved, `Revised` stamped), plus a run-state sidecar for resume.
-- **Refine loop** — steer the plan before spending tokens on execution (up to 3 refine rounds). Refining is fast: each round is a single completion that edits the written plan — it never re-explores the repo, revises the saved file in place, and re-presents it as **rev N** where you first saw it.
+- **Refine loop** — steer the plan before spending tokens on execution (up to 3 revision rounds). A refine round is one fast completion that edits the written plan in place (read-only tools may verify a fact the feedback challenges, but the repo is never re-explored) and re-presents it as **rev N** where you first saw it. When the feedback needs fresh repo knowledge — new scope, an invalidated premise — choose **Re-plan** instead: the full pipeline runs again (explore + re-draft) with your feedback, same in-place redisplay.
 
 ## Install
 
@@ -55,7 +55,7 @@ pi -e ./src/index.ts
 ```
 
 1. **Plan** — your active model drafts the DAG. The planner runs as a read-only subagent that delegates repo exploration to a dedicated explore subagent via the `explore` tool, so raw file reads stay out of the planner's context and that context is preserved for drafting the plan — and the plan still cites real paths and exact commands.
-2. **Review** — the plan renders as a wave/dependency card (**Ctrl+O** expands the raw JSON). Choose **Execute**, **Refine** with feedback, or **Reject**. Each refine round is one quick completion that edits the plan in place (no re-exploration), the plan file is updated at the same path, and the revised card is re-rendered as **rev 2** in its original spot.
+2. **Review** — the plan renders as a wave/dependency card (**Ctrl+O** expands the raw JSON). Choose **Execute**, **Refine** with feedback, **Re-plan** with feedback, or **Reject**. Each refine round is one quick completion that edits the plan in place (no re-exploration); Re-plan re-runs the full pipeline — repo exploration plus a fresh draft — for feedback the written plan can't absorb. Either way the plan file is updated at the same path and the revised card is re-rendered as **rev 2** in its original spot.
 3. **Execute** — independent branches run as parallel subagents; Esc cancels, Ctrl+O expands per-node reports while running.
 
 ```
@@ -95,7 +95,9 @@ The intended loop: `init` → commit baseline → edit `PRODUCT.md` → `/dag-co
 
 **Explore subagent.** With `plannerExplore` (default on), the planner delegates repo exploration to a dedicated read-only researcher: it asks focused, self-contained questions (at most ~4 explore calls — the researcher sees only the question, not the planning conversation) and gets back one compact markdown brief per question (direct answer, key files, exact commands, notes) capped at 16 KB. Only the brief enters the planner's context, which stays available for drafting the plan JSON. The researcher inherits the planner's model and thinking level; if a researcher run fails, the planner falls back to its own read/grep/find/ls tools for whatever it still needs.
 
-**Refine.** Refining is deliberately a different (much cheaper) beast from planning. The plan is already written — its prompts, paths, and commands already carry whatever the exploration found — so a refine round never re-explores the repo. It is a single tool-less completion: the current plan (in full) plus your feedback goes in, and the complete revised plan comes back (unchanged steps copied verbatim, step ids and dependencies preserved or re-wired, same one-document JSON contract, `steps: []` still a valid no-op). The saved plan file is then revised in place — same path, original `Created` timestamp, a `Revised` line added, status back to pending — and the plan card is re-presented in the transcript as **(rev N)** with an updated footer, so you see the change where you reviewed the original.
+**Refine.** Refining is deliberately a different (much cheaper) beast from planning. The plan is already written — its prompts, paths, and commands already carry whatever the exploration found — so a refine round never re-explores the repo (the explore tool isn't even loaded). It is one completion: the current plan (in full) plus your feedback goes in, and the complete revised plan comes back (unchanged steps copied verbatim, step ids and dependencies preserved or re-wired, same one-document JSON contract, `steps: []` still a valid no-op). The refine subagent keeps read-only repo tools, and the prompt makes them the exception: a handful of targeted reads at most, and only when your feedback challenges a specific fact (a path, a command, an API) — a refine whose model never calls a tool is just a completion. Facts the refine genuinely cannot know are not guessed; the affected step's prompt is written so the executing subagent (which has full tools) verifies them first. The saved plan file is then revised in place — same path, original `Created` timestamp, a `Revised` line added, status back to pending — and the plan card is re-presented in the transcript as **(rev N)** with an updated footer, so you see the change where you reviewed the original.
+
+**Re-plan.** When the feedback is bigger than an edit — new scope the plan never covered, an invalidated premise, a wrong architectural direction — the gate offers **Re-plan**: the full planning pipeline runs again (repo exploration plus a complete re-draft) with your feedback and the current plan as context. It shares the ≤3-round budget with refine, always explores (even with `plannerExplore: false`), and re-presents the result the same way — in place at the same path, as **rev N**.
 
 **Scheduler.** A worker pool runs every node whose dependencies are complete. `touches` are mutex-protected at the scheduler: a node holds its declared files/resources for its whole run, and a ready node whose touches collide stays pending (named in the runner panel) until the holder finishes.
 
@@ -149,7 +151,7 @@ All options are optional JSON config; project values override global per key. In
 | `maxParallel` | `4` | Max concurrent node subagents |
 | `parallel` | `true` | `false` = one node at a time in DAG order (overrides `maxParallel`) |
 | `nodeRetries` | `1` | Auto-retries per node for transient failures; agent-reported task failures are never retried |
-| `plannerExplore` | `true` | Planner explores the repo first via the explore subagent; `false` = faster blind single call. Refine always skips exploration (it edits the written plan). Also enables the `explore` tool — no new keys: the researcher inherits `plannerModel`/`plannerThinking` |
+| `plannerExplore` | `true` | Planner explores the repo first via the explore subagent; `false` = faster blind single call. Refine rounds always skip exploration (they edit the written plan, with read-only verification reads only); the gate's Re-plan option always explores, regardless of this key. Also enables the `explore` tool — no new keys: the researcher inherits `plannerModel`/`plannerThinking` |
 | `plannerModel` | current model | Planner model as `"provider/model"` (any configured provider, not just the session's) |
 | `plannerThinking` | current level | Planner thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (the pi CLI clamps it to the model's capabilities) |
 | `runnerModel` | current model | Model for every runner node subagent, as `"provider/model"` |
@@ -159,7 +161,7 @@ All options are optional JSON config; project values override global per key. In
 
 `plannerModel` / `runnerModel` default to the session's current model (and `…Thinking` to its current thinking level), so behavior is unchanged unless you set them — e.g. pin a strong model for planning and a cheap/fast one for node execution. Configured labels are validated at run start: an unknown `provider/model` or a missing API key for its provider fails before the plan is drafted.
 
-Fixed limits (not configurable): 1 re-plan on invalid JSON, 3 refine rounds, plans in `~/.agents/plans/` (revised in place on refine), 8 KB per dep / 16 KB total injected into node prompts.
+Fixed limits (not configurable): 1 auto re-roll on invalid JSON, 3 revision rounds (refine or re-plan), plans in `~/.agents/plans/` (revised in place on refine/re-plan), 8 KB per dep / 16 KB total injected into node prompts.
 
 ## Requirements
 

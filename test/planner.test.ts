@@ -457,17 +457,30 @@ test("plan() blind path pins a configured planner model and thinking level too",
 });
 
 // ---------------------------------------------------------------------------
-// Refine: a single blind edit of the current plan (never re-explores)
+// Refine: one completion that edits the current plan (read-only verification
+// reads allowed, never re-explores)
 // ---------------------------------------------------------------------------
 
-test("buildRefinePlannerArgs pins a tool-less refine subagent with the refine prompt", () => {
+test("buildRefinePlannerArgs pins a read-only refine subagent (no explore tool, no write tools) with the refine prompt", () => {
 	assert.deepEqual(buildRefinePlannerArgs("anthropic/claude-x", "medium", { ...DEFAULT_CONFIG, maxSteps: 12 }), [
 		"--mode", "json", "-p", "--no-session",
 		"--model", "anthropic/claude-x",
 		"--thinking", "medium",
-		"--no-extensions", "--no-skills", "--no-context-files", "--no-tools",
+		"--no-extensions", "--no-skills", "--no-context-files",
+		"--tools", "read,grep,find,ls",
 		"--system-prompt", refinePlannerPrompt(12),
 	]);
+});
+
+test("buildRefinePlannerArgs keeps the blind planner's lockdown (no extensions/skills/context files)", () => {
+	const args = buildRefinePlannerArgs("p/m");
+	assert.ok(args.includes("--no-extensions"), "no auto-discovered extensions");
+	assert.ok(args.includes("--no-skills"), "no skills");
+	assert.ok(args.includes("--no-context-files"), "no context files");
+	assert.ok(args.includes("--no-session"), "no session");
+	assert.ok(!args.includes("--no-tools"), "tools are no longer forbidden — read-only tools are allowed");
+	assert.equal(args[args.indexOf("--tools") + 1], "read,grep,find,ls", "read-only set only: no explore, no write/bash tools");
+	assert.ok(!args.includes(EXPLORE_TOOL_PATH), "no explore tool: refining never runs nested researchers");
 });
 
 test("buildRefinePlannerArgs omits --thinking when undefined and interpolates the soft cap", () => {
@@ -488,19 +501,29 @@ test("refine prompt: edit in place, verbatim copies, stable ids, same output con
 	assert.match(p, /Preserve step ids/i, "ids are stable: dependents reference them");
 	assert.match(p, /remove or rename a step, update every dependsOn/i, "removals re-wire dependencies");
 	assert.match(p, /~12 steps/i, "soft cap interpolated");
-	assert.match(p, /\"steps": \[\]/, "no-op still the correct answer when the feedback retracts the work");
+	assert.match(p, /\"steps": \[\]/i, "no-op still the correct answer when the feedback retracts the work");
 	assert.match(p, /never invent steps/i);
 	assert.match(p, /serialized at run time/i);
 	assert.match(p, /never what to plan/i, "PLAN.md stays how-to, not what-to");
 });
 
-test("plan() refine runs a single blind completion even when exploration is configured", async () => {
+test("refine prompt: verification-only tool discipline, unknowns delegated to the executing subagent", () => {
+	const p = refinePlannerPrompt(12);
+	assert.match(p, /read-only repository tools/i, "names the read-only tools");
+	assert.match(p, /make NO tool calls/i, "tool use is the exception, not the default");
+	assert.match(p, /a handful of calls at most/i, "targeted verification, not a re-survey");
+	assert.match(p, /Never re-survey the repository/i, "no re-exploration from inside refine");
+	assert.match(p, /do not guess/i, "unknown facts are not invented");
+	assert.match(p, /executing subagent verifies first/i, "verification is delegated to the tool-having executor");
+});
+
+test("plan() refine keeps read-only tools but never loads the explore tool, even when exploration is configured", async () => {
 	let capturedArgs: string[] | undefined;
 	const result = await plan(fakeCtx(), "Add tests", {
 		refine: true,
 		priorPlanJson: validPlanJson,
 		feedback: "split the survey step",
-		// Exploring is the default config, but refine must still be blind.
+		// Exploring is the default config, but refine must never explore.
 		spawnImpl: (_command, args) => {
 			capturedArgs = args;
 			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
@@ -509,9 +532,9 @@ test("plan() refine runs a single blind completion even when exploration is conf
 	assert.ok(result);
 	assert.ok(capturedArgs);
 	assert.equal(capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1], refinePlannerPrompt(DEFAULT_MAX_STEPS));
-	assert.ok(capturedArgs!.includes("--no-tools"), "refine has no tools");
-	assert.ok(!capturedArgs!.includes("--tools"), "no read-only tool allow-list either");
-	assert.ok(!capturedArgs!.includes(EXPLORE_TOOL_PATH), "no explore tool");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--tools") + 1], "read,grep,find,ls", "read-only tools only — no explore, no write tools");
+	assert.ok(!capturedArgs!.includes(EXPLORE_TOOL_PATH), "no explore tool: no nested researchers");
+	assert.ok(!capturedArgs!.some((a) => a.includes("explore")), "no explore tool in the allow-list either");
 });
 
 test("plan() refine includes the current plan in full (no tail cap) framed as the plan to revise", async () => {
@@ -560,12 +583,29 @@ test("plan() refine frames the feedback as an edit request and asks for the comp
 	assert.ok(!capturedText!.includes("Address this feedback / error from the previous attempt"));
 });
 
-test("plan() refine never surfaces tool activity (there are no tools)", async () => {
+test("plan() refine surfaces read-only tool activity in the loader (verification reads)", async () => {
 	const snippets: string[] = [];
 	await plan(fakeCtx(), "Add tests", {
 		refine: true,
 		priorPlanJson: validPlanJson,
-		feedback: "x",
+		feedback: "the test command in s2 looks wrong — check it",
+		onExplore: (s) => snippets.push(s),
+		spawnImpl: () =>
+			fakeProc([
+				{ type: "tool_execution_start", toolCallId: "1", toolName: "read", args: { file_path: "package.json" } },
+				{ type: "message_start", message: { role: "assistant" } },
+				{ type: "message_end", message: assistantMessage(validPlanJson) },
+			]),
+	});
+	assert.deepEqual(snippets, ["read package.json", "thinking…"], "verification reads + thinking surface in the loader");
+});
+
+test("plan() refine wires no tool callbacks beyond the read-only set (blind stays silent)", async () => {
+	// Sanity: the blind (non-refine, explore-off) flavor still wires no
+	// tool/message/compaction callbacks at all — it is the only tool-less one.
+	const snippets: string[] = [];
+	await plan(fakeCtx(), "Add tests", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
 		onExplore: (s) => snippets.push(s),
 		spawnImpl: () =>
 			fakeProc([
@@ -573,7 +613,79 @@ test("plan() refine never surfaces tool activity (there are no tools)", async ()
 				{ type: "message_end", message: assistantMessage(validPlanJson) },
 			]),
 	});
-	assert.deepEqual(snippets, [], "blind refine wires no tool/message/compaction callbacks");
+	assert.deepEqual(snippets, [], "blind planner wires no tool/message/compaction callbacks");
+});
+
+// ---------------------------------------------------------------------------
+// Re-plan: the full exploring pipeline with the feedback (the gate's Re-plan)
+// ---------------------------------------------------------------------------
+
+test("plan() re-plan forces exploration even when plannerExplore is disabled", async () => {
+	let capturedArgs: string[] | undefined;
+	const result = await plan(fakeCtx(), "Add tests", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		replan: true,
+		priorPlanJson: validPlanJson,
+		feedback: "use the event bus, not REST",
+		spawnImpl: (_command, args) => {
+			capturedArgs = args;
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.ok(result);
+	assert.ok(capturedArgs);
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--system-prompt") + 1], plannerSystemPrompt(DEFAULT_MAX_STEPS), "the exploring planner prompt");
+	assert.equal(capturedArgs![capturedArgs!.indexOf("--tools") + 1], "read,grep,find,ls,explore", "full read-only + explore tool set");
+	assert.ok(capturedArgs!.includes(EXPLORE_TOOL_PATH), "explore tool loaded: re-plan re-explores the repo");
+});
+
+test("plan() re-plan includes the current plan in full and frames the feedback as a re-plan request", async () => {
+	// A large current plan (well past MAX_PRIOR_OUTPUT_CHARS): a failed
+	// truncation retry gets tail-capped, but a re-plan's context is the whole
+	// current plan (the user's feedback may reference any of its steps).
+	const bigPrompt = "Do the thing. ".repeat(1500); // ~21KB inside one step
+	const currentPlan = JSON.stringify({
+		goal: "Big goal",
+		steps: [
+			{ id: "head", title: "Head", prompt: "HEAD-MARKER keep me", dependsOn: [] },
+			{ id: "big", title: "Big", prompt: bigPrompt, dependsOn: ["head"] },
+		],
+	}, null, 2);
+	assert.ok(currentPlan.length > 20000, `plan must exceed the retry cap (${currentPlan.length} chars)`);
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "Add tests", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		replan: true,
+		priorPlanJson: currentPlan,
+		feedback: "the whole approach is wrong — do it via the event bus",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.match(capturedText!, /asked you to re-plan it/i, "re-plan framing, not the retry framing");
+	assert.ok(capturedText!.includes("the whole approach is wrong — do it via the event bus"), "the feedback is present");
+	assert.match(capturedText!, /Explore the repository as needed/i, "re-draft is expected to explore");
+	assert.ok(capturedText!.includes("HEAD-MARKER keep me"), "head of the current plan is NOT elided");
+	assert.ok(capturedText!.includes(bigPrompt), "full current plan present (no tail cap)");
+	assert.ok(!capturedText!.includes("earlier output elided"), "no elision marker for a re-plan context");
+	assert.ok(!capturedText!.includes("Address this feedback / error from the previous attempt"), "user feedback is not framed as an attempt error");
+});
+
+test("plan() fresh planning without refine/replan keeps the old retry framing (unchanged)", async () => {
+	let capturedText: string | undefined;
+	await plan(fakeCtx(), "Add tests", {
+		config: { ...DEFAULT_CONFIG, plannerExplore: false },
+		feedback: "some error",
+		priorPlanJson: "broken output",
+		spawnImpl: (_command, args) => {
+			capturedText = args[args.length - 1];
+			return fakeProc([{ type: "message_end", message: assistantMessage(validPlanJson) }]);
+		},
+	});
+	assert.match(capturedText!, /Address this feedback \/ error from the previous attempt/, "non-replan keeps the retry framing");
+	assert.match(capturedText!, /A previous attempt's output/, "retry prior-output framing intact");
+	assert.ok(!capturedText!.includes("re-plan"), "no re-plan framing leaks into a plain retry");
 });
 
 // ---------------------------------------------------------------------------

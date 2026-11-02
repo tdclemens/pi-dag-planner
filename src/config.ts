@@ -70,7 +70,10 @@ export interface DagPlanConfig {
 	nodeRetries: number;
 	/**
 	 * Planner explores the repo as a read-only subagent before planning.
-	 * `false` = the faster single blind LLM call (no tools).
+	 * `false` = the faster single blind LLM call (no tools). Refine rounds
+	 * always skip exploration (they edit the written plan, with read-only
+	 * verification reads only); the gate's Re-plan option always explores,
+	 * regardless of this key.
 	 */
 	plannerExplore: boolean;
 	/**

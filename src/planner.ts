@@ -11,11 +11,19 @@
  *   whose file reads never enter the planner's own context — before emitting
  *   the plan JSON.
  * - blind (faster, plannerExplore: false): a single tool-less LLM completion.
- * - refining (the refine loop): always a single tool-less completion, even
- *   when the initial plan explored. The current plan already encodes the
+ * - refining (the refine loop): one completion that edits the written plan,
+ *   even when the initial plan explored. The current plan already encodes the
  *   repository knowledge the exploration produced (paths, commands, touches),
- *   so revising it needs no re-exploration — one fast call that edits the
- *   written plan instead of re-deriving it.
+ *   so revising it needs no re-exploration: the explore tool is never loaded.
+ *   Read-only repo tools (read/grep/find/ls — no write tools) stay available
+ *   so feedback that challenges a specific fact can be verified in place, but
+ *   the prompt makes tool use the exception, so a typical refine stays one
+ *   fast call.
+ * - re-planning (the gate's "Re-plan" option): the full exploring pipeline
+ *   again — fresh repo exploration plus a complete re-draft — for feedback
+ *   the written plan cannot absorb without re-reading the repo (new scope,
+ *   invalidated premises). Forces exploration even when plannerExplore is
+ *   false; the current plan is included as context for the feedback.
  *
  * Both pin the planner model and thinking level via CLI flags: config
  * "plannerModel"/"plannerThinking" when set (host resolves them), else the
@@ -98,15 +106,23 @@ Rules:
 }
 
 /**
- * System prompt for refining an existing plan (the refine loop, always
- * blind): the user's message carries the current plan JSON plus feedback,
- * and the model returns the complete revised plan — changed steps updated,
- * unchanged steps copied verbatim. Kept separate from blindPlannerPrompt
- * because it is tuned for editing (preserve ids and untouched steps) rather
- * than decomposing from scratch.
+ * System prompt for refining an existing plan (the refine loop): the user's
+ * message carries the current plan JSON plus feedback, and the model returns
+ * the complete revised plan — changed steps updated, unchanged steps copied
+ * verbatim. Kept separate from blindPlannerPrompt because it is tuned for
+ * editing (preserve ids and untouched steps) rather than decomposing from
+ * scratch. The subagent gets read-only repo tools (buildRefinePlannerArgs);
+ * this prompt makes tool use the exception — verifying a fact the feedback
+ * challenges, never re-surveying — and delegates genuinely unknown facts to
+ * the tool-having executing subagents.
  */
 export function refinePlannerPrompt(maxSteps: number): string {
 	return `You are a DAG planner revising a plan the user already has. The user's message contains the plan to revise and feedback. The plan decomposes the user's task into steps that isolated coding subagents will execute in parallel; it was already drafted and reviewed, so treat it as the starting point — change only what the feedback requires, and keep everything else intact.
+
+Grounding — you have read-only repository tools, and using them is the exception, not the default:
+- By default make NO tool calls: the plan was drafted after repository exploration, so its prompts, paths, and commands already carry the repository knowledge. Most feedback is applied as a pure edit of the document.
+- Use read/grep/find/ls only when the feedback challenges or requires a specific repository fact the plan does not settle (a path, a command, an existing API). Keep it targeted: a handful of calls at most, each aimed at one fact. Never re-survey the repository or re-derive the plan from source — that is re-planning, not revising.
+- If the feedback adds scope the plan never covered, or a needed fact is genuinely unknown, do not guess: write the affected step's prompt so the executing subagent verifies first (name the exact file to read or the command to run), then does the work. Executing subagents have full tools and can discover what you cannot.
 
 Respond with ONLY a JSON object — no prose, no markdown fences — the complete revised plan, matching exactly:
 {
@@ -262,15 +278,20 @@ export function buildBlindPlannerArgs(modelLabel: string, thinkingLevel?: string
 }
 
 /**
- * pi CLI flags for the refine subagent: identical lockdown to the blind
- * planner (single tool-less completion) with the refine system prompt —
- * refining never re-explores the repo, because the current plan already
- * carries the repository knowledge the exploration produced.
+ * pi CLI flags for the refine subagent: the blind planner's lockdown
+ * (--no-extensions --no-skills --no-context-files) with read-only repo tools
+ * (read/grep/find/ls — the exploring planner's set minus the explore tool,
+ * and no write/bash tools: a refine must never modify the repo) and the
+ * refine system prompt. Refining never re-explores the repo — the explore
+ * tool is not loaded, so no nested researchers — but a targeted read or grep
+ * is available to verify a fact the feedback challenges; the prompt makes
+ * tool use the exception, so typical refines stay one completion.
  */
 export function buildRefinePlannerArgs(modelLabel: string, thinkingLevel?: string, config?: DagPlanConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--model", modelLabel];
 	if (thinkingLevel) args.push("--thinking", thinkingLevel);
-	args.push("--no-extensions", "--no-skills", "--no-context-files", "--no-tools");
+	args.push("--no-extensions", "--no-skills", "--no-context-files");
+	args.push("--tools", "read,grep,find,ls");
 	args.push("--system-prompt", refinePlannerPrompt(getMaxSteps(config)));
 	return args;
 }
@@ -411,13 +432,22 @@ export const PLANNER_MAX_ATTEMPTS = 2;
 export interface PlanOptions {
 	/**
 	 * Refine, not a fresh plan: `priorPlanJson` is the current, accepted
-	 * plan being revised (not a failed attempt). The call is always a single
-	 * tool-less completion — refining never re-explores the repo, because the
-	 * current plan already encodes the repository knowledge the exploration
-	 * produced (paths, commands, touches). This keeps the refine loop fast:
-	 * one completion to edit the written plan, then an in-place redisplay.
+	 * plan being revised (not a failed attempt). The call is one completion
+	 * that edits the current plan: it never re-explores the repo (no explore
+	 * tool), but read-only repo tools (read/grep/find/ls) are available to
+	 * verify a specific fact the feedback challenges — the prompt makes tool
+	 * use the exception, so a typical refine stays one fast completion.
 	 */
 	refine?: boolean;
+	/**
+	 * Re-plan from scratch (the gate's "Re-plan" option): the full exploring
+	 * pipeline — repo exploration plus a complete re-draft — for feedback the
+	 * written plan cannot absorb without re-reading the repo (new scope,
+	 * invalidated premises). Forces exploration even when `plannerExplore` is
+	 * false, and includes `priorPlanJson` (the current plan) in full as
+	 * context for the feedback.
+	 */
+	replan?: boolean;
 	/** User feedback (refine) or prior validation error (retry). */
 	feedback?: string;
 	/** The prior plan JSON (refine) or the failed raw output (retry). */
@@ -446,8 +476,11 @@ export interface PlanOptions {
  * by default it explores the repo read-only before planning (config
  * plannerExplore: false = a single tool-less blind completion), and the
  * plan JSON is extracted from its final message. Refine (opts.refine)
- * instead runs a single tool-less completion that edits the current plan
- * (opts.priorPlanJson) per the feedback — no re-exploration. Model/
+ * instead runs one completion that edits the current plan (opts.priorPlanJson)
+ * per the feedback — never re-explores, but read-only tools may verify a
+ * challenged fact. Re-plan (opts.replan) runs the full exploring pipeline
+ * with the feedback, forcing exploration even when plannerExplore is false.
+ * Model/
  * thinking: config "plannerModel"/"plannerThinking" when set
  * (opts.modelLabel / opts.thinkingLevel), else the session's current model
  * and thinking level. When the project root (ctx.cwd) has a PLAN.md, its
@@ -466,11 +499,20 @@ export async function plan(
 	const model = ctx.model;
 	if (!model) throw new Error("no model selected (use /model)");
 	const cfg = opts.config ?? DEFAULT_CONFIG;
-	// Refine is always blind: re-exploring the repo for an edit of an already
-	// written plan would redo the most expensive part of planning for no gain
-	// (the plan's prompts, paths, and commands already carry what the
-	// exploration found). The initial plan still honors plannerExplore.
-	const exploring = plannerExplores(cfg) && !opts.refine;
+	// Refine is one edit of the written plan: re-exploring the repo for an
+	// edit of an already written plan would redo the most expensive part of
+	// planning for no gain (the plan's prompts, paths, and commands already
+	// carry what the exploration found) — so it never explores, though
+	// read-only tools may verify a fact the feedback challenges. Re-plan is
+	// the opposite: the full exploring pipeline, because that is the case
+	// where fresh repo knowledge IS needed, even when plannerExplore is off.
+	const exploring = (plannerExplores(cfg) || opts.replan) && !opts.refine;
+	// Tool activity (snippets / thinking / compaction) is surfaced for every
+	// flavor that has tools — the exploring planner and refine (read-only
+	// verification reads). Blind is the only truly tool-less flavor, and a
+	// refine whose model never calls a tool renders an empty snippet line,
+	// so the loader box is unchanged for the typical no-tools refine.
+	const toolActivity = exploring || Boolean(opts.refine);
 	const modelLabel = opts.modelLabel ?? `${model.provider}/${model.id}`;
 	const thinkingLevel = opts.thinkingLevel ?? ctx.thinkingLevel;
 
@@ -497,12 +539,26 @@ export async function plan(
 			);
 		}
 	} else {
-		if (opts.priorPlanJson)
+		if (opts.replan && opts.priorPlanJson)
+			parts.push(
+				// The current plan, in full — no tail cap (capPriorOutput): the
+				// user's feedback may reference its specific steps, and a plan
+				// is bounded by maxSteps, not unbounded. On a re-plan retry the
+				// prior is instead the failed attempt's output, hence the hedge.
+				`The current plan (an earlier version the user is replacing, or a failed attempt's output that may be invalid or truncated) — context for the feedback, not an edit target; re-derive from the repository:\n\n${opts.priorPlanJson}`,
+			);
+		else if (opts.priorPlanJson)
 			parts.push(`A previous attempt's output (it may be invalid or truncated):\n\n${capPriorOutput(opts.priorPlanJson)}`);
 		if (opts.feedback) {
 			const hint = retryHintFor(opts.feedback);
+			const lead = opts.replan
+				? "The user reviewed the current plan and asked you to re-plan it, with this feedback:"
+				: "Address this feedback / error from the previous attempt:";
+			const tail = opts.replan
+				? "Explore the repository as needed, then respond with ONLY the complete JSON plan."
+				: "Respond again with ONLY the revised JSON plan.";
 			parts.push(
-				`Address this feedback / error from the previous attempt:\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\nRespond again with ONLY the revised JSON plan.`,
+				`${lead}\n\n${opts.feedback}${hint ? `\n\n${hint}` : ""}\n\n${tail}`,
 			);
 		}
 	}
@@ -519,12 +575,12 @@ export async function plan(
 		userText,
 		cfg,
 		spawnImpl: opts.spawnImpl,
-		onToolCall: exploring ? (toolName, argsObj) => opts.onExplore?.(formatSnippetPlain(toolName, argsObj)) : undefined,
+		onToolCall: toolActivity ? (toolName, argsObj) => opts.onExplore?.(formatSnippetPlain(toolName, argsObj)) : undefined,
 		// Same silent-window blind spot as the run dashboard: while the
-		// exploring planner's context compacts (or the model generates), the
-		// loader's snippet line would otherwise sit on a stale tool call.
-		onMessageStart: exploring ? () => opts.onExplore?.("thinking…") : undefined,
-		onCompaction: exploring
+		// planner's context compacts (or the model generates), the loader's
+		// snippet line would otherwise sit on a stale tool call.
+		onMessageStart: toolActivity ? () => opts.onExplore?.("thinking…") : undefined,
+		onCompaction: toolActivity
 			? (phase, { reason }) => opts.onExplore?.(phase === "start" ? `compacting context…${reason ? ` (${reason})` : ""}` : "thinking…")
 			: undefined,
 	});
@@ -574,11 +630,11 @@ export async function planWithRetries(
 }
 
 /**
- * Run the planner as a pi subagent (exploring or blind — the args builder
- * decides the flavor) and extract + validate the plan from its final
+ * Run the planner as a pi subagent (exploring, blind, or refine — the args
+ * builder decides the flavor) and extract + validate the plan from its final
  * message. Returns null when aborted (Esc / session); throws with a
  * diagnostic otherwise (spawn/exit error, model error, missing output, bad
- * JSON, invalid plan). Shared by both planner flavors: the subagent also
+ * JSON, invalid plan). Shared by all planner flavors: the subagent also
  * gives the blind path uniform model/thinking handling (CLI flags) and the
  * same abort/usage accounting as the exploring one.
  */

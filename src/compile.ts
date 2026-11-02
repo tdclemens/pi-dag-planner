@@ -134,6 +134,12 @@ const COMPILE_CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md", "DESIGN.md"];
  * - Never committed, or a repo with no HEAD → `git diff --no-index
  *   /dev/null PRODUCT.md` (exit code 1 means a diff exists; exit 2 is an
  *   error).
+ * Both forms pass `--default-prefix` so the header always uses the
+ * canonical `a/` `b/` file labels, regardless of the user's diff.*
+ * configuration (mnemonicPrefix makes modern git label --no-index files
+ * `1/` `2/`; noprefix/srcPrefix would mangle the header in other ways).
+ * Git pre-2.32 rejects the flag (usage error) and is retried without it;
+ * those versions default to `a/` `b/` for these inputs.
  * Returns null when PRODUCT.md is absent on disk, git cannot produce a
  * diff, or the diff is empty. The result is capped at
  * MAX_COMPILE_DIFF_CHARS (appending the "…(diff truncated)" marker).
@@ -150,15 +156,23 @@ export async function getProductMdDiff(cwd: string): Promise<string | null> {
 	const headExists = (await runGit(cwd, ["rev-parse", "-q", "--verify", "HEAD"])).code === 0;
 	const tracked = (await runGit(cwd, ["ls-files", "--error-unmatch", "--", PRODUCT_MD])).code === 0;
 
+	// `--default-prefix` pins the canonical a/ b/ header labels (see above).
+	// Git that predates the flag dies with a usage error (129) before
+	// doing anything; retry once without it.
+	const diffWithDefaultPrefix = async (args: string[]): Promise<GitRun> => {
+		const r = await runGit(cwd, ["diff", "--default-prefix", ...args]);
+		return r.code === 129 ? runGit(cwd, ["diff", ...args]) : r;
+	};
+
 	let out: string;
 	if (tracked && headExists) {
-		const r = await runGit(cwd, ["diff", "HEAD", "--", PRODUCT_MD]);
+		const r = await diffWithDefaultPrefix(["HEAD", "--", PRODUCT_MD]);
 		if (r.code !== 0) return null;
 		out = r.stdout;
 	} else {
 		// Untracked (or no HEAD): diff against /dev/null. Exit 0 = no diff,
 		// 1 = diff exists (on stdout), 2 = error.
-		const r = await runGit(cwd, ["diff", "--no-index", "/dev/null", PRODUCT_MD]);
+		const r = await diffWithDefaultPrefix(["--no-index", "/dev/null", PRODUCT_MD]);
 		if (r.code > 1) return null;
 		out = r.stdout;
 	}
